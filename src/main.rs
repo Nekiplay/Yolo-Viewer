@@ -53,7 +53,7 @@ struct YoloGuiApp {
 
 impl YoloGuiApp {
     fn new(_cc: &eframe::CreationContext<'_>) -> Self {
-        let default_models = ["yolo11n-seg.onnx", "yolo11n.onnx", "yolov8n-seg.onnx", "yolov8n.onnx"];
+        let default_models = ["yolo11n-seg.onnx", "yolo11n.onnx", "yolov8n-seg.onnx", "yolov8n.onnx", "model.onnx", "best.onnx"];
         let mut session = None;
         let mut loaded_path = None;
 
