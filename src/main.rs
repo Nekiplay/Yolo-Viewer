@@ -1,19 +1,16 @@
+#![windows_subsystem = "windows"]
+
 use eframe::egui;
-use image::{DynamicImage, RgbaImage};
+use image::{DynamicImage, RgbaImage, ImageBuffer, Rgba};
 use std::sync::{Arc, Mutex, mpsc};
 use std::path::PathBuf;
 use std::collections::HashMap;
 use ort::value::{Value, ValueType};
-// Убедитесь, что yolo_rs и arcstr добавлены в Cargo.toml
-// [dependencies]
-// eframe = "0.28" (или ваша версия)
-// image = "0.24"
-// ort = { version = "2.0.0-rc.4", features = ["cuda"] } # Или другая версия ORT
-// yolo-rs = "0.1" (или ваша библиотека)
-// arcstr = "1.1"
-// arboard = "3.2"
-// serde_json = "1.0"
 use yolo_rs::{YoloEntityOutput, model, BoundingBox};
+
+// --- КОНСТАНТЫ ---
+const MASK_PROTO_SIZE: usize = 160;
+const MASK_COEFFS_NUM: usize = 32;
 
 enum ImageInput {
     File(PathBuf),
@@ -22,21 +19,28 @@ enum ImageInput {
 
 struct DetectionResult {
     texture_data: egui::ColorImage,
+    mask_texture: Option<egui::ColorImage>,
     detections: Vec<YoloEntityOutput>,
     img_size: egui::Vec2,
 }
 
+#[derive(Clone)]
+struct Candidate {
+    det: YoloEntityOutput,
+    mask_coeffs: Vec<f32>,
+    class_id: usize,
+}
+
 struct YoloGuiApp {
-    model_session: Arc<Mutex<model::YoloModelSession>>,
+    model_session: Option<Arc<Mutex<model::YoloModelSession>>>,
     model_input_size: (u32, u32),
     class_names: Arc<Vec<String>>, 
     
-    // Состояние изображения
     texture: Option<egui::TextureHandle>,
+    mask_texture: Option<egui::TextureHandle>,
     detections: Vec<YoloEntityOutput>,
     img_size: egui::Vec2,
     
-    // Зум и навигация
     zoom: f32,
     hovered_idx: Option<usize>,
     
@@ -48,51 +52,111 @@ struct YoloGuiApp {
 }
 
 impl YoloGuiApp {
-    fn new(_cc: &eframe::CreationContext<'_>, model_path: PathBuf) -> Self {
-        let mut session = model::YoloModelSession::from_filename_v8(&model_path)
-            .expect("Failed to load model");
+    fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+        let default_models = ["yolo11n-seg.onnx", "yolo11n.onnx", "yolov8n-seg.onnx", "yolov8n.onnx"];
+        let mut session = None;
+        let mut loaded_path = None;
 
-        // Извлечение имен классов
-        let mut class_names = get_coco_names();
-        if let Ok(metadata) = session.session.metadata() {
-            if let Ok(Some(names_raw)) = metadata.custom("names") {
-                let fixed = names_raw.replace('\'', "\"").replace("{", "{\"").replace(": ", "\": ").replace(", ", ", \"");
-                if let Ok(map) = serde_json::from_str::<HashMap<String, String>>(&fixed) {
-                    let mut keys: Vec<u32> = map.keys().filter_map(|k| k.parse().ok()).collect();
-                    keys.sort();
-                    let new_names: Vec<String> = keys.iter().filter_map(|k| map.get(&k.to_string()).cloned()).collect();
-                    if !new_names.is_empty() { class_names = new_names; }
+        for name in default_models {
+            let path = PathBuf::from(name);
+            if path.exists() {
+                println!("Найдена модель: {:?}", path);
+                if let Ok(mut s) = model::YoloModelSession::from_filename_v8(&path) {
+                    s.probability_threshold = Some(0.25);
+                    s.iou_threshold = Some(0.45);
+                    session = Some(Arc::new(Mutex::new(s)));
+                    loaded_path = Some(name.to_string());
+                    break;
                 }
             }
         }
 
-        let input_size = if let Some(input) = session.session.inputs.first() {
-            if let ValueType::Tensor { shape, .. } = &input.input_type {
-                (shape[3] as u32, shape[2] as u32)
-            } else { (640, 640) }
-        } else { (640, 640) };
+        let (input_size, class_names) = if let Some(s) = &session {
+            let guard = s.lock().unwrap();
+            let size = if let Some(input) = guard.session.inputs.first() {
+                if let ValueType::Tensor { shape, .. } = &input.input_type {
+                    (shape[3] as u32, shape[2] as u32)
+                } else { (640, 640) }
+            } else { (640, 640) };
+            
+            let mut names = get_coco_names();
+            if let Ok(meta) = guard.session.metadata() {
+                 if let Ok(Some(raw)) = meta.custom("names") {
+                    let fixed = raw.replace('\'', "\"").replace("{", "{\"").replace(": ", "\": ").replace(", ", ", \"");
+                    if let Ok(map) = serde_json::from_str::<HashMap<String, String>>(&fixed) {
+                         let mut keys: Vec<u32> = map.keys().filter_map(|k| k.parse().ok()).collect();
+                         keys.sort();
+                         let new_names: Vec<String> = keys.iter().filter_map(|k| map.get(&k.to_string()).cloned()).collect();
+                         if !new_names.is_empty() { names = new_names; }
+                    }
+                 }
+            }
+            (size, Arc::new(names))
+        } else {
+            ((640, 640), Arc::new(get_coco_names()))
+        };
 
         let (tx, rx) = mpsc::channel();
-        session.probability_threshold = Some(0.4);
-        session.iou_threshold = Some(0.4);
+        let status = loaded_path.map(|n| format!("Модель: {}", n)).unwrap_or_else(|| "Перетащите .onnx файл модели".to_string());
 
         Self {
-            model_session: Arc::new(Mutex::new(session)),
+            model_session: session,
             model_input_size: input_size,
-            class_names: Arc::new(class_names),
+            class_names: class_names,
             texture: None,
+            mask_texture: None,
             detections: Vec::new(),
             img_size: egui::Vec2::ZERO,
             zoom: 1.0,
             hovered_idx: None,
             tx, rx,
             is_processing: false,
-            status: "Готов. Ctrl+V или Drag&Drop.".to_string(),
+            status,
+        }
+    }
+
+    fn load_model(&mut self, path: PathBuf) {
+        println!("Попытка загрузки модели: {:?}", path);
+        match model::YoloModelSession::from_filename_v8(&path) {
+            Ok(mut s) => {
+                s.probability_threshold = Some(0.25);
+                s.iou_threshold = Some(0.45);
+                let size = if let Some(input) = s.session.inputs.first() {
+                     if let ValueType::Tensor { shape, .. } = &input.input_type {
+                        (shape[3] as u32, shape[2] as u32)
+                     } else { (640, 640) }
+                } else { (640, 640) };
+                
+                let mut names = get_coco_names();
+                if let Ok(meta) = s.session.metadata() {
+                     if let Ok(Some(raw)) = meta.custom("names") {
+                        let fixed = raw.replace('\'', "\"").replace("{", "{\"").replace(": ", "\": ").replace(", ", ", \"");
+                        if let Ok(map) = serde_json::from_str::<HashMap<String, String>>(&fixed) {
+                             let mut keys: Vec<u32> = map.keys().filter_map(|k| k.parse().ok()).collect();
+                             keys.sort();
+                             let l: Vec<String> = keys.iter().filter_map(|k| map.get(&k.to_string()).cloned()).collect();
+                             if !l.is_empty() { names = l; }
+                        }
+                     }
+                }
+                self.model_session = Some(Arc::new(Mutex::new(s)));
+                self.model_input_size = size;
+                self.class_names = Arc::new(names);
+                self.status = format!("Загружено: {:?}", path.file_name().unwrap());
+                println!("Модель загружена успешно. Вход: {:?}", size);
+            }
+            Err(e) => { 
+                self.status = format!("Ошибка: {:?}", e); 
+                eprintln!("Ошибка загрузки: {:?}", e);
+            }
         }
     }
 
     fn run_worker(&self, input: ImageInput, ctx: egui::Context) {
-        let model_arc = Arc::clone(&self.model_session);
+        let model_arc = match &self.model_session {
+            Some(m) => Arc::clone(m),
+            None => return,
+        };
         let names_arc = Arc::clone(&self.class_names);
         let tx = self.tx.clone();
         let (tw, th) = self.model_input_size;
@@ -107,7 +171,6 @@ impl YoloGuiApp {
 
                 let resized = original_img.resize_exact(tw, th, image::imageops::FilterType::Triangle);
                 let rgb = resized.to_rgb8();
-                
                 let mut flat_data = vec![0.0f32; (3 * th * tw) as usize];
                 let area = (th * tw) as usize;
                 for (x, y, pixel) in rgb.enumerate_pixels() {
@@ -119,45 +182,70 @@ impl YoloGuiApp {
 
                 let input_tensor = Value::from_array((vec![1usize, 3, th as usize, tw as usize], flat_data)).map_err(|e| e.to_string())?;
                 
-                let (shape, data_vec) = {
+                let (output0_shape, output0_data, output1_opt) = {
                     let mut m = model_arc.lock().unwrap();
                     let outputs = m.session.run(ort::inputs![input_tensor]).map_err(|e| e.to_string())?;
-                    let (shape, slice) = outputs[0].try_extract_tensor::<f32>().map_err(|e| e.to_string())?;
-                    (shape.to_vec(), slice.to_vec()) 
+                    let (s0, d0) = outputs[0].try_extract_tensor::<f32>().map_err(|e| e.to_string())?;
+                    let out1 = if outputs.len() > 1 {
+                         let (s1, d1) = outputs[1].try_extract_tensor::<f32>().map_err(|e| e.to_string())?;
+                         Some((s1.to_vec(), d1.to_vec()))
+                    } else { None };
+                    (s0.to_vec(), d0.to_vec(), out1)
                 }; 
 
-                let num_rows = shape[1] as usize;   
-                let num_anchors = shape[2] as usize;
-                let mut candidates = Vec::new();
+                let num_rows = output0_shape[1] as usize; 
+                let num_anchors = output0_shape[2] as usize;
+                let num_classes = names_arc.len();
+                let has_masks = output1_opt.is_some() && num_rows >= (4 + num_classes + MASK_COEFFS_NUM);
                 
+                let mut candidates = Vec::new();
+
                 for i in 0..num_anchors {
                     let mut max_conf = 0.0f32;
                     let mut class_id = 0;
-                    for c in 4..num_rows {
-                        let conf = data_vec[c * num_anchors + i];
-                        if conf > max_conf { max_conf = conf; class_id = c - 4; }
+                    for c in 0..num_classes {
+                        let conf = output0_data[(4 + c) * num_anchors + i];
+                        if conf > max_conf { max_conf = conf; class_id = c; }
                     }
-                    
-                    if max_conf > 0.4 {
-                        let cx = data_vec[0 * num_anchors + i];
-                        let cy = data_vec[1 * num_anchors + i];
-                        let w = data_vec[2 * num_anchors + i];
-                        let h = data_vec[3 * num_anchors + i];
+                    if max_conf > 0.25 {
+                        let cx = output0_data[0 * num_anchors + i];
+                        let cy = output0_data[1 * num_anchors + i];
+                        let w = output0_data[2 * num_anchors + i];
+                        let h = output0_data[3 * num_anchors + i];
                         
-                        let label = names_arc.get(class_id).cloned().unwrap_or_else(|| format!("{}", class_id)); // ID если нет имени
-                        candidates.push(YoloEntityOutput {
-                            bounding_box: BoundingBox { x1: cx - w / 2.0, y1: cy - h / 2.0, x2: cx + w / 2.0, y2: cy + h / 2.0 },
-                            confidence: max_conf,
-                            label: arcstr::ArcStr::from(label),
+                        let label = names_arc.get(class_id).cloned().unwrap_or_else(|| format!("{}", class_id));
+                        let mut mask_coeffs = Vec::new();
+                        if has_masks {
+                            let start_idx = 4 + num_classes;
+                            for m in 0..MASK_COEFFS_NUM {
+                                mask_coeffs.push(output0_data[(start_idx + m) * num_anchors + i]);
+                            }
+                        }
+                        candidates.push(Candidate {
+                            det: YoloEntityOutput {
+                                bounding_box: BoundingBox { x1: cx - w / 2.0, y1: cy - h / 2.0, x2: cx + w / 2.0, y2: cy + h / 2.0 },
+                                confidence: max_conf,
+                                label: arcstr::ArcStr::from(label),
+                            },
+                            mask_coeffs,
+                            class_id,
                         });
                     }
                 }
 
-                let detections = perform_nms(candidates, 0.45);
+                let kept_indices = perform_nms_indices(&candidates, 0.45);
+                let final_detections: Vec<YoloEntityOutput> = kept_indices.iter().map(|&i| candidates[i].det.clone()).collect();
+                
+                let mask_image = if has_masks && !kept_indices.is_empty() {
+                    let (_, proto_data) = output1_opt.unwrap();
+                    let kept_candidates: Vec<&Candidate> = kept_indices.iter().map(|&i| &candidates[i]).collect();
+                    Some(process_masks(&kept_candidates, &proto_data, (tw as usize, th as usize)))
+                } else { None };
 
                 let _ = tx.send(DetectionResult {
                     texture_data: load_egui_image(&original_img),
-                    detections,
+                    mask_texture: mask_image,
+                    detections: final_detections,
                     img_size: egui::vec2(img_w, img_h),
                 });
                 Ok(())
@@ -169,265 +257,128 @@ impl YoloGuiApp {
 
     fn handle_clipboard(&mut self, ctx: &egui::Context) {
         if let Ok(mut cb) = arboard::Clipboard::new() {
-            if let Ok(img_data) = cb.get_image() {
-                let rgba = RgbaImage::from_raw(img_data.width as u32, img_data.height as u32, img_data.bytes.to_vec());
-                if let Some(rgba) = rgba {
-                    self.is_processing = true;
-                    self.run_worker(ImageInput::Pixels(DynamicImage::ImageRgba8(rgba)), ctx.clone());
-                    return;
+             if let Ok(img_data) = cb.get_image() {
+                  let bytes = img_data.bytes.into_owned();
+                  if let Some(rgba) = RgbaImage::from_raw(img_data.width as u32, img_data.height as u32, bytes) {
+                      self.is_processing = true;
+                      self.run_worker(ImageInput::Pixels(DynamicImage::ImageRgba8(rgba)), ctx.clone());
+                  }
+             } else if let Ok(text) = cb.get_text() {
+                 let path = PathBuf::from(text.trim_matches('"').trim());
+                 if path.exists() {
+                     self.is_processing = true;
+                     self.run_worker(ImageInput::File(path), ctx.clone());
+                 }
+             }
+        }
+   }
+}
+
+// --- ОТРИСОВКА МАСОК ---
+fn process_masks(
+    candidates: &[&Candidate], 
+    proto_data: &[f32], 
+    model_size: (usize, usize) 
+) -> egui::ColorImage {
+    let (mw, mh) = (MASK_PROTO_SIZE, MASK_PROTO_SIZE);
+    let proto_len = mw * mh;
+
+    let mut mask_buffer = ImageBuffer::<Rgba<u8>, Vec<u8>>::new(model_size.0 as u32, model_size.1 as u32);
+    
+    let colors: Vec<[u8; 4]> = candidates.iter().map(|c| {
+        let col = get_color_raw(&c.det.label);
+        [col[0], col[1], col[2], 200] 
+    }).collect();
+
+    for (idx, cand) in candidates.iter().enumerate() {
+        let b = &cand.det.bounding_box;
+        let color = colors[idx];
+        let coeffs = &cand.mask_coeffs;
+
+        let x1 = b.x1.max(0.0) as u32;
+        let y1 = b.y1.max(0.0) as u32;
+        let x2 = b.x2.min(model_size.0 as f32) as u32;
+        let y2 = b.y2.min(model_size.1 as f32) as u32;
+
+        if x2 <= x1 || y2 <= y1 { continue; }
+
+        for y in y1..y2 {
+            for x in x1..x2 {
+                let mx = ((x as f32 / model_size.0 as f32) * mw as f32) as usize;
+                let my = ((y as f32 / model_size.1 as f32) * mh as f32) as usize;
+                
+                if mx >= mw || my >= mh { continue; }
+
+                let offset = my * mw + mx;
+                let mut sum = 0.0f32;
+                for k in 0..MASK_COEFFS_NUM {
+                    sum += coeffs[k] * proto_data[k * proto_len + offset];
                 }
-            }
-            if let Ok(text) = cb.get_text() {
-                let path = PathBuf::from(text.trim_matches('"').trim());
-                if path.exists() && path.is_file() {
-                    self.is_processing = true;
-                    self.run_worker(ImageInput::File(path), ctx.clone());
+                
+                let mask_val = 1.0 / (1.0 + (-sum).exp());
+
+                if mask_val > 0.5 {
+                    mask_buffer.put_pixel(x, y, Rgba(color));
                 }
             }
         }
     }
+    
+    egui::ColorImage::from_rgba_unmultiplied(
+        [mask_buffer.width() as _, mask_buffer.height() as _], 
+        mask_buffer.as_flat_samples().as_slice()
+    )
 }
 
-impl eframe::App for YoloGuiApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // 1. Сначала обрабатываем получение результатов от потока
-        if let Ok(res) = self.rx.try_recv() {
-            self.texture = Some(ctx.load_texture("img", res.texture_data, Default::default()));
-            self.detections = res.detections;
-            self.img_size = res.img_size;
-            self.is_processing = false;
-            self.zoom = 1.0;
-            self.status = format!("Готово. Найдено объектов: {}", self.detections.len());
+fn perform_nms_indices(candidates: &Vec<Candidate>, iou_threshold: f32) -> Vec<usize> {
+    let mut indices: Vec<usize> = (0..candidates.len()).collect();
+    indices.sort_by(|&i, &j| candidates[j].det.confidence.partial_cmp(&candidates[i].det.confidence).unwrap());
+    let mut active = vec![true; candidates.len()];
+    let mut kept = Vec::new();
+    for &i in &indices {
+        if !active[i] { continue; }
+        kept.push(i);
+        let a = &candidates[i].det.bounding_box;
+        let area_a = (a.x2 - a.x1) * (a.y2 - a.y1);
+        for &j in &indices {
+            if i == j || !active[j] { continue; }
+            let b = &candidates[j].det.bounding_box;
+            let ix1 = a.x1.max(b.x1); let iy1 = a.y1.max(b.y1);
+            let ix2 = a.x2.min(b.x2); let iy2 = a.y2.min(b.y2);
+            if ix2 < ix1 || iy2 < iy1 { continue; }
+            let inter = (ix2 - ix1) * (iy2 - iy1);
+            let union = area_a + (b.x2 - b.x1) * (b.y2 - b.y1) - inter;
+            if union > 0.0 && (inter / union) > iou_threshold { active[j] = false; }
         }
-
-        // 2. Логика ввода (Ctrl+V и Drag & Drop)
-        // Мы собираем намерение загрузить файл в переменную, чтобы избежать конфликтов borrowing
-        let mut next_input = None;
-
-        // A) Проверка Ctrl+V
-        if ctx.input_mut(|i| i.consume_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::V))) {
-            if let Ok(mut cb) = arboard::Clipboard::new() {
-                let mut found = false;
-                // Пробуем как картинку
-                if let Ok(img_data) = cb.get_image() {
-                    if let Some(rgba) = RgbaImage::from_raw(img_data.width as u32, img_data.height as u32, img_data.bytes.into_owned()) {
-                        next_input = Some(ImageInput::Pixels(DynamicImage::ImageRgba8(rgba)));
-                        found = true;
-                    }
-                }
-                // Если не картинка, пробуем как текст (путь к файлу)
-                if !found {
-                    if let Ok(text) = cb.get_text() {
-                        let path = PathBuf::from(text.trim_matches('"').trim());
-                        if path.exists() && path.is_file() {
-                            next_input = Some(ImageInput::File(path));
-                            found = true;
-                        }
-                    }
-                }
-                
-                if !found {
-                    self.status = "Буфер обмена пуст или формат не поддерживается".to_string();
-                }
-            } else {
-                self.status = "Ошибка доступа к буферу обмена".to_string();
-            }
-        }
-
-        // B) Проверка Drag & Drop
-        // Важно: проверяем dropped_files до отрисовки UI
-        if !ctx.input(|i| i.raw.dropped_files.is_empty()) {
-            ctx.input(|i| {
-                if let Some(dropped) = i.raw.dropped_files.first() {
-                    if let Some(path) = &dropped.path {
-                        next_input = Some(ImageInput::File(path.clone()));
-                    }
-                }
-            });
-        }
-
-        // 3. Запуск обработки, если что-то пришло
-        if let Some(input) = next_input {
-            self.is_processing = true;
-            self.status = "Обработка...".to_string();
-            self.run_worker(input, ctx.clone());
-        }
-
-        // 4. Обычная логика зума
-        let z_delta = ctx.input(|i| i.zoom_delta());
-        if z_delta != 1.0 {
-            self.zoom = (self.zoom * z_delta).clamp(0.1, 20.0);
-        }
-
-        // --- ОТРИСОВКА ИНТЕРФЕЙСА ---
-
-        // Боковая панель
-        egui::SidePanel::right("side").width_range(160.0..=250.0).show(ctx, |ui| {
-            ui.heading(format!("Найдено: {}", self.detections.len()));
-            ui.separator();
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                let mut hovered_in_list = None;
-                for (i, det) in self.detections.iter().enumerate() {
-                    let color = get_color(&det.label);
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 8.0;
-                        let (rect, _resp) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
-                        ui.painter().circle_filled(rect.center(), 4.0, color);
-
-                        let text = format!("{}  {:.0}%", det.label, det.confidence * 100.0);
-                        let is_selected = self.hovered_idx == Some(i);
-                        let res = ui.selectable_label(is_selected, text);
-                        if res.hovered() { hovered_in_list = Some(i); }
-                    });
-                }
-                if hovered_in_list.is_some() {
-                    self.hovered_idx = hovered_in_list;
-                }
-            });
-        });
-
-        // Статус бар
-        egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                if self.is_processing { ui.spinner(); }
-                ui.label(&self.status);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Сброс (1:1)").clicked() { self.zoom = 1.0; }
-                    ui.label(format!("Zoom: {:.0}%", self.zoom * 100.0));
-                });
-            });
-        });
-
-        // Центральная панель
-        egui::CentralPanel::default().show(ctx, |ui| {
-            if let Some(tex) = &self.texture {
-                let display_size = self.img_size * self.zoom;
-                
-                egui::ScrollArea::both().show(ui, |ui| {
-                    let (rect, response) = ui.allocate_exact_size(display_size, egui::Sense::hover());
-                    
-                    ui.painter().image(tex.id(), rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
-                    
-                    let mut hovered_on_canvas = None;
-                    if let Some(ptr_pos) = response.hover_pos() {
-                        let scale_x = (self.img_size.x / self.model_input_size.0 as f32) * self.zoom;
-                        let scale_y = (self.img_size.y / self.model_input_size.1 as f32) * self.zoom;
-                        
-                        for (i, det) in self.detections.iter().enumerate().rev() {
-                            let b = &det.bounding_box;
-                            let screen_rect = egui::Rect::from_min_max(
-                                egui::pos2(b.x1 * scale_x, b.y1 * scale_y) + rect.min.to_vec2(),
-                                egui::pos2(b.x2 * scale_x, b.y2 * scale_y) + rect.min.to_vec2(),
-                            );
-                            if screen_rect.contains(ptr_pos) {
-                                hovered_on_canvas = Some(i);
-                                break; 
-                            }
-                        }
-                    }
-                    if hovered_on_canvas.is_some() { self.hovered_idx = hovered_on_canvas; }
-                    
-                    let painter = ui.painter();
-                    let scale_x = (self.img_size.x / self.model_input_size.0 as f32) * self.zoom;
-                    let scale_y = (self.img_size.y / self.model_input_size.1 as f32) * self.zoom;
-
-                    for (i, det) in self.detections.iter().enumerate() {
-                        let b = &det.bounding_box;
-                        let base_color = get_color(&det.label);
-                        let is_hovered = self.hovered_idx == Some(i);
-                        let color = if is_hovered { base_color.linear_multiply(1.5) } else { base_color };
-                        
-                        let screen_rect = egui::Rect::from_min_max(
-                            egui::pos2(b.x1 * scale_x, b.y1 * scale_y) + rect.min.to_vec2(),
-                            egui::pos2(b.x2 * scale_x, b.y2 * scale_y) + rect.min.to_vec2(),
-                        );
-
-                        painter.rect_filled(screen_rect, 4.0, color.linear_multiply(0.15));
-                        let stroke_width = if is_hovered { 3.0 } else { 1.5 };
-                        painter.rect_stroke(screen_rect, 4.0, egui::Stroke::new(stroke_width, color));
-                        
-                        if is_hovered || self.zoom > 0.4 {
-                            let label_text = format!("{} {:.0}%", det.label, det.confidence * 100.0);
-                            let font_size = (13.0 * self.zoom).clamp(10.0, 24.0);
-                            let font_id = egui::FontId::proportional(font_size);
-                            let galley = painter.layout_no_wrap(label_text, font_id, egui::Color32::WHITE);
-                            
-                            let mut label_pos = screen_rect.min;
-                            if label_pos.y - galley.size().y - 6.0 < rect.min.y {
-                                label_pos.y += 2.0; 
-                            } else {
-                                label_pos.y -= galley.size().y + 4.0;
-                            }
-
-                            let label_rect = egui::Rect::from_min_size(label_pos, galley.size() + egui::vec2(8.0, 4.0));
-                            painter.rect_filled(label_rect, 4.0, color);
-                            painter.galley(label_rect.min + egui::vec2(4.0, 2.0), galley, egui::Color32::WHITE);
-                        }
-                    }
-                });
-            } else {
-                ui.centered_and_justified(|ui| {
-                    ui.label(egui::RichText::new("Перетащите картинку сюда или нажмите Ctrl+V").size(24.0).color(egui::Color32::GRAY));
-                });
-            }
-        });
     }
+    kept
 }
 
-// Хелперы
-fn get_color(label: &str) -> egui::Color32 {
+fn get_color_raw(label: &str) -> [u8; 3] {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
-    
-    let mut hasher = DefaultHasher::new();
-    label.hash(&mut hasher);
-    let h = hasher.finish();
-    
-    let hue = (h % 360) as f32 / 360.0;
-    egui::ecolor::Hsva::new(hue, 0.85, 0.85, 1.0).into()
+    let mut h = DefaultHasher::new();
+    label.hash(&mut h);
+    let hue = (h.finish() % 360) as f32 / 360.0;
+    let (s, v) = (1.0, 1.0);
+    let c = v * s;
+    let x = c * (1.0 - ((hue * 6.0) % 2.0 - 1.0).abs());
+    let m = v - c;
+    let (r, g, b) = match (hue * 6.0) as i32 {
+        0 => (c, x, 0.0), 1 => (x, c, 0.0), 2 => (0.0, c, x),
+        3 => (0.0, x, c), 4 => (x, 0.0, c), _ => (c, 0.0, x),
+    };
+    [((r + m) * 255.0) as u8, ((g + m) * 255.0) as u8, ((b + m) * 255.0) as u8]
 }
 
-fn perform_nms(mut candidates: Vec<YoloEntityOutput>, iou_threshold: f32) -> Vec<YoloEntityOutput> {
-    candidates.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap());
-    let mut selected: Vec<YoloEntityOutput> = Vec::new();
-    let mut active = vec![true; candidates.len()];
-
-    for i in 0..candidates.len() {
-        if !active[i] { continue; }
-        let a = &candidates[i];
-        selected.push(a.clone());
-        
-        for j in (i + 1)..candidates.len() {
-            if !active[j] { continue; }
-            let b = &candidates[j];
-            
-            let b1 = &a.bounding_box; 
-            let b2 = &b.bounding_box;
-            
-            let inter_x1 = b1.x1.max(b2.x1);
-            let inter_y1 = b1.y1.max(b2.y1);
-            let inter_x2 = b1.x2.min(b2.x2);
-            let inter_y2 = b1.y2.min(b2.y2);
-
-            let inter_area = (inter_x2 - inter_x1).max(0.0) * (inter_y2 - inter_y1).max(0.0);
-            let area1 = (b1.x2 - b1.x1) * (b1.y2 - b1.y1);
-            let area2 = (b2.x2 - b2.x1) * (b2.y2 - b2.y1);
-            
-            let union_area = area1 + area2 - inter_area;
-            let iou = if union_area <= 0.0 { 0.0 } else { inter_area / union_area };
-            
-            if iou > iou_threshold {
-                active[j] = false;
-            }
-        }
-    }
-    selected
+fn get_color(label: &str) -> egui::Color32 {
+    let rgb = get_color_raw(label);
+    egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2])
 }
 
 fn load_egui_image(img: &DynamicImage) -> egui::ColorImage {
     let size = [img.width() as _, img.height() as _];
-    let rgba = img.to_rgba8();
-    egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_flat_samples().as_slice())
+    egui::ColorImage::from_rgba_unmultiplied(size, img.to_rgba8().as_flat_samples().as_slice())
 }
 
 fn get_coco_names() -> Vec<String> {
@@ -435,16 +386,152 @@ fn get_coco_names() -> Vec<String> {
         .iter().map(|s| s.to_string()).collect()
 }
 
+// --- ИНТЕРФЕЙС ---
+impl eframe::App for YoloGuiApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if let Ok(res) = self.rx.try_recv() {
+            self.texture = Some(ctx.load_texture("img", res.texture_data, Default::default()));
+            self.mask_texture = res.mask_texture.map(|m| ctx.load_texture("masks", m, egui::TextureOptions::LINEAR));
+            self.detections = res.detections;
+            self.img_size = res.img_size;
+            self.is_processing = false;
+            self.zoom = 1.0;
+            self.status = format!("Найдено: {} | Маски: {}", self.detections.len(), if self.mask_texture.is_some() {"OK"} else {"-"});
+        }
+
+        if !ctx.input(|i| i.raw.dropped_files.is_empty()) {
+            let dropped = ctx.input(|i| i.raw.dropped_files.first().cloned());
+             if let Some(d) = dropped {
+                 if let Some(path) = d.path {
+                    if let Some(ext) = path.extension() {
+                        if ext.to_string_lossy().to_lowercase() == "onnx" {
+                            self.load_model(path);
+                        } else if self.model_session.is_some() {
+                            self.is_processing = true;
+                            self.run_worker(ImageInput::File(path), ctx.clone());
+                        }
+                    }
+                 }
+             }
+        }
+        if ctx.input_mut(|i| i.consume_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::V))) {
+            if self.model_session.is_some() { self.handle_clipboard(ctx); }
+        }
+
+        let z_delta = ctx.input(|i| i.zoom_delta());
+        if z_delta != 1.0 { self.zoom = (self.zoom * z_delta).clamp(0.1, 20.0); }
+
+        egui::SidePanel::right("side").width_range(160.0..=250.0).show(ctx, |ui| {
+            ui.heading("Объекты");
+            ui.separator();
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                let mut lh = None;
+                for (i, det) in self.detections.iter().enumerate() {
+                    let col = get_color(&det.label);
+                    ui.horizontal(|ui| {
+                        let (r, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                        ui.painter().circle_filled(r.center(), 4.0, col);
+                        if ui.selectable_label(self.hovered_idx == Some(i), format!("{} {:.0}%", det.label, det.confidence * 100.0)).hovered() {
+                            lh = Some(i);
+                        }
+                    });
+                }
+                if lh.is_some() { self.hovered_idx = lh; }
+            });
+        });
+
+        egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                if self.is_processing { ui.spinner(); }
+                ui.label(&self.status);
+            });
+        });
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            if self.model_session.is_none() {
+                ui.centered_and_justified(|ui| { ui.heading("Загрузите модель (перетащите .onnx)"); });
+                return;
+            }
+
+            if let Some(tex) = &self.texture {
+                let display_size = self.img_size * self.zoom;
+                egui::ScrollArea::both().show(ui, |ui| {
+                    let (rect, resp) = ui.allocate_exact_size(display_size, egui::Sense::hover());
+                    
+                    // 1. Рисуем Картинку
+                    ui.painter().image(tex.id(), rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
+                    
+                    // 2. Рисуем Маски (Overlay)
+                    if let Some(m) = &self.mask_texture {
+                        ui.painter().image(m.id(), rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
+                    }
+
+                    let mut h_id = None;
+                    if let Some(ptr) = resp.hover_pos() {
+                        let sx = (self.img_size.x / self.model_input_size.0 as f32) * self.zoom;
+                        let sy = (self.img_size.y / self.model_input_size.1 as f32) * self.zoom;
+                        for (i, d) in self.detections.iter().enumerate().rev() {
+                            let b = &d.bounding_box;
+                            // Считаем рамку для детекта мыши
+                            let r = egui::Rect::from_min_max(
+                                egui::pos2(b.x1 * sx, b.y1 * sy) + rect.min.to_vec2(),
+                                egui::pos2(b.x2 * sx, b.y2 * sy) + rect.min.to_vec2(),
+                            );
+                            if r.contains(ptr) { h_id = Some(i); break; }
+                        }
+                    }
+                    if h_id.is_some() { self.hovered_idx = h_id; }
+
+                    // 3. Рисуем ОБВОДКУ (Рамки)
+                    let p = ui.painter();
+                    let sx = (self.img_size.x / self.model_input_size.0 as f32) * self.zoom;
+                    let sy = (self.img_size.y / self.model_input_size.1 as f32) * self.zoom;
+                    
+                    for (i, d) in self.detections.iter().enumerate() {
+                        let b = &d.bounding_box;
+                        let col = get_color(&d.label);
+                        let is_h = self.hovered_idx == Some(i);
+                        let c = if is_h { col.linear_multiply(1.5) } else { col };
+                        
+                        let r = egui::Rect::from_min_max(
+                            egui::pos2(b.x1 * sx, b.y1 * sy) + rect.min.to_vec2(),
+                            egui::pos2(b.x2 * sx, b.y2 * sy) + rect.min.to_vec2(),
+                        );
+                        
+                        // ОБВОДКА: Всегда 2.0 (или 4.0 при наведении).
+                        // ВАЖНО: Rounding 0.0 (прямые углы у рамки, чтобы совпадало с маской)
+                        p.rect_stroke(r, 0.0, egui::Stroke::new(if is_h {4.0} else {2.0}, c));
+
+                        // Текст
+                        if is_h || self.zoom > 0.4 {
+                             let t = format!("{} {:.0}%", d.label, d.confidence * 100.0);
+                             let f = egui::FontId::proportional((13.0*self.zoom).clamp(10.0, 24.0));
+                             let g = p.layout_no_wrap(t, f, egui::Color32::WHITE);
+                             let mut lp = r.min;
+                             if lp.y - g.size().y - 5.0 < rect.min.y { lp.y += 2.0; } else { lp.y -= g.size().y + 4.0; }
+                             let lr = egui::Rect::from_min_size(lp, g.size() + egui::vec2(8.0, 4.0));
+                             
+                             // Закругление плашки текста только сверху
+                             let rounding = egui::Rounding { nw: 4.0, ne: 4.0, sw: 0.0, se: 0.0 };
+                             p.rect_filled(lr, rounding, c);
+                             p.galley(lr.min + egui::vec2(1.0, 2.0), g, egui::Color32::WHITE);
+                        }
+                    }
+                });
+            } else {
+                ui.centered_and_justified(|ui| ui.label("Перетащите картинку или Ctrl+V"));
+            }
+        });
+    }
+}
+
 fn main() -> eframe::Result<()> {
-    let model_path = PathBuf::from("yolov8n.onnx"); 
     eframe::run_native(
         "YOLO Ultimate Viewer",
         eframe::NativeOptions {
-            viewport: egui::ViewportBuilder::default()
-                .with_inner_size([1200.0, 850.0])
-                .with_drag_and_drop(true),
+            viewport: egui::ViewportBuilder::default().with_inner_size([1200.0, 850.0]).with_drag_and_drop(true),
             ..Default::default()
         },
-        Box::new(|cc| Ok(Box::new(YoloGuiApp::new(cc, model_path)))),
+        Box::new(|cc| Ok(Box::new(YoloGuiApp::new(cc)))),
     )
 }
