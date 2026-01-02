@@ -601,7 +601,7 @@ impl eframe::App for YoloGuiApp {
                     }
                 });
             } else {
-                ui.centered_and_justified(|ui| ui.label("Перетащите картинку или Ctrl+V"));
+                ui.centered_and_justified(|ui| ui.label("Перетащите картинку"));
             }
         });
     }
