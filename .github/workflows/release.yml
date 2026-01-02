@@ -115,9 +115,6 @@ jobs:
             ## 👏 Contributors Hall of Fame
             Special thanks to our amazing contributors who made this release possible:
             - **@Nekiplay** - Core improvements and feature implementations
-
-            ---
-            *Thank you for using Cross Cleaner! Your system, cleaner than ever.*
           files: |
             linux-binaries/Linux-yolo-viewer
             macos-binaries-arm64/MacOS-Arm64-yolo-viewer
