@@ -7,10 +7,9 @@ use ort::value::{Value, ValueType};
 use yolo_rs::{YoloEntityOutput, model, BoundingBox};
 
 // --- КОНСТАНТЫ ---
-const MASK_PROTO_SIZE: usize = 160;
 const MASK_COEFFS_NUM: usize = 32;
 
-// --- ТИПЫ ДАННЫХ ---
+// --- ТИПЫ ---
 enum ImageInput {
     File(PathBuf),
     Pixels(DynamicImage),
@@ -23,17 +22,16 @@ struct DetectionResult {
     img_size: egui::Vec2,
 }
 
-// Обертка для сообщений от воркера к UI
-enum AppMessage {
-    Success(DetectionResult),
-    Error(String),
-}
-
 #[derive(Clone)]
 struct Candidate {
     det: YoloEntityOutput,
     mask_coeffs: Vec<f32>,
     class_id: usize,
+}
+
+enum AppMessage {
+    Success(DetectionResult),
+    Error(String),
 }
 
 struct YoloGuiApp {
@@ -49,7 +47,6 @@ struct YoloGuiApp {
     zoom: f32,
     hovered_idx: Option<usize>,
     
-    // Канал теперь передает AppMessage
     tx: mpsc::Sender<AppMessage>,
     rx: mpsc::Receiver<AppMessage>,
     
@@ -59,14 +56,15 @@ struct YoloGuiApp {
 
 impl YoloGuiApp {
     fn new(_cc: &eframe::CreationContext<'_>) -> Self {
-        let default_models = ["yolo11n-seg.onnx", "yolo11n.onnx", "yolov8n-seg.onnx", "yolov8n.onnx"];
+        // Добавил best.onnx в список автозагрузки
+        let default_models = ["best.onnx", "yolo11n-seg.onnx", "yolo11n.onnx", "yolov8n-seg.onnx", "yolov8n.onnx"];
         let mut session = None;
         let mut loaded_path = None;
 
         for name in default_models {
             let path = PathBuf::from(name);
             if path.exists() {
-                println!("Найдена модель: {:?}", path);
+                println!("Auto-loading: {:?}", path);
                 if let Ok(mut s) = model::YoloModelSession::from_filename_v8(&path) {
                     s.probability_threshold = Some(0.25);
                     s.iou_threshold = Some(0.45);
@@ -77,33 +75,38 @@ impl YoloGuiApp {
             }
         }
 
+        // Пытаемся достать размер входа и имена классов
         let (input_size, class_names) = if let Some(s) = &session {
             let guard = s.lock().unwrap();
+            
+            // Определяем размер входа (часто 640, но может быть 512 и т.д.)
             let size = if let Some(input) = guard.session.inputs.first() {
                 if let ValueType::Tensor { shape, .. } = &input.input_type {
                     (shape[3] as u32, shape[2] as u32)
                 } else { (640, 640) }
             } else { (640, 640) };
             
-            let mut names = get_coco_names();
+            // Пытаемся достать имена, иначе генерируем заглушки
+            let mut names = Vec::new(); 
             if let Ok(meta) = guard.session.metadata() {
                  if let Ok(Some(raw)) = meta.custom("names") {
                     let fixed = raw.replace('\'', "\"").replace("{", "{\"").replace(": ", "\": ").replace(", ", ", \"");
                     if let Ok(map) = serde_json::from_str::<HashMap<String, String>>(&fixed) {
                          let mut keys: Vec<u32> = map.keys().filter_map(|k| k.parse().ok()).collect();
                          keys.sort();
-                         let new_names: Vec<String> = keys.iter().filter_map(|k| map.get(&k.to_string()).cloned()).collect();
-                         if !new_names.is_empty() { names = new_names; }
+                         let loaded_names: Vec<String> = keys.iter().filter_map(|k| map.get(&k.to_string()).cloned()).collect();
+                         if !loaded_names.is_empty() { names = loaded_names; }
                     }
                  }
             }
+            // Если имен нет, создаем "Class 0", "Class 1"... позже, динамически
             (size, Arc::new(names))
         } else {
-            ((640, 640), Arc::new(get_coco_names()))
+            ((640, 640), Arc::new(Vec::new()))
         };
 
         let (tx, rx) = mpsc::channel();
-        let status = loaded_path.map(|n| format!("Модель готова: {}", n)).unwrap_or_else(|| "Перетащите .onnx файл модели".to_string());
+        let status = loaded_path.map(|n| format!("Модель: {}", n)).unwrap_or_else(|| "Перетащите .onnx файл".to_string());
 
         Self {
             model_session: session,
@@ -122,7 +125,7 @@ impl YoloGuiApp {
     }
 
     fn load_model(&mut self, path: PathBuf) {
-        println!("Загрузка модели: {:?}", path);
+        println!("Загрузка: {:?}", path);
         match model::YoloModelSession::from_filename_v8(&path) {
             Ok(mut s) => {
                 s.probability_threshold = Some(0.25);
@@ -134,7 +137,7 @@ impl YoloGuiApp {
                      } else { (640, 640) }
                 } else { (640, 640) };
                 
-                let mut names = get_coco_names();
+                let mut names = Vec::new();
                 if let Ok(meta) = s.session.metadata() {
                      if let Ok(Some(raw)) = meta.custom("names") {
                         let fixed = raw.replace('\'', "\"").replace("{", "{\"").replace(": ", "\": ").replace(", ", ", \"");
@@ -151,10 +154,10 @@ impl YoloGuiApp {
                 self.model_input_size = size;
                 self.class_names = Arc::new(names);
                 self.status = format!("Загружено: {:?}", path.file_name().unwrap());
-                println!("Успех. Input size: {:?}", size);
+                println!("Размер входа модели: {:?}", size);
             }
             Err(e) => { 
-                self.status = format!("Ошибка загрузки: {:?}", e); 
+                self.status = format!("Ошибка: {:?}", e); 
                 eprintln!("Load Error: {:?}", e);
             }
         }
@@ -170,16 +173,13 @@ impl YoloGuiApp {
         let (tw, th) = self.model_input_size;
         
         std::thread::spawn(move || {
-            println!("--- Start Inference Worker ---");
             let process = || -> Result<DetectionResult, String> {
-                // 1. Load Image
                 let original_img = match input {
-                    ImageInput::File(path) => image::open(&path).map_err(|e| format!("ImgOpen: {}", e))?,
+                    ImageInput::File(path) => image::open(&path).map_err(|e| e.to_string())?,
                     ImageInput::Pixels(img) => img,
                 };
                 let (img_w, img_h) = (original_img.width() as f32, original_img.height() as f32);
 
-                // 2. Preprocessing
                 let resized = original_img.resize_exact(tw, th, image::imageops::FilterType::Triangle);
                 let rgb = resized.to_rgb8();
                 let mut flat_data = vec![0.0f32; (3 * th * tw) as usize];
@@ -192,62 +192,79 @@ impl YoloGuiApp {
                 }
 
                 let input_tensor = Value::from_array((vec![1usize, 3, th as usize, tw as usize], flat_data))
-                    .map_err(|e| format!("TensorCreate: {}", e))?;
+                    .map_err(|e| e.to_string())?;
                 
-                println!("Running ONNX Session...");
-                // 3. Inference
+                // --- INFERENCE ---
                 let (output0_shape, output0_data, output1_opt) = {
                     let mut m = model_arc.lock().unwrap();
-                    let outputs = m.session.run(ort::inputs![input_tensor]).map_err(|e| format!("SessionRun: {}", e))?;
+                    let outputs = m.session.run(ort::inputs![input_tensor]).map_err(|e| e.to_string())?;
+                    let (s0, d0) = outputs[0].try_extract_tensor::<f32>().map_err(|e| e.to_string())?;
                     
-                    // Output 0 (Boxes)
-                    let (s0, d0) = outputs[0].try_extract_tensor::<f32>().map_err(|e| format!("ExtractOut0: {}", e))?;
-                    
-                    // Output 1 (Prototypes) - только если есть второй выход
                     let out1 = if outputs.len() > 1 {
-                         let (s1, d1) = outputs[1].try_extract_tensor::<f32>().map_err(|e| format!("ExtractOut1: {}", e))?;
-                         println!("Segmentation masks found. Shape: {:?}", s1);
-                         Some((s1.to_vec(), d1.to_vec()))
-                    } else { 
-                        println!("No segmentation masks output.");
-                        None 
-                    };
+                         let (s1, d1) = outputs[1].try_extract_tensor::<f32>().map_err(|e| e.to_string())?;
+                         // Сохраняем размеры масок (важно для 512x512!)
+                         let mask_dims = (s1[3] as usize, s1[2] as usize); // [batch, 32, h, w] -> (w, h)
+                         Some((mask_dims, d1.to_vec()))
+                    } else { None };
                     (s0.to_vec(), d0.to_vec(), out1)
                 }; 
 
-                println!("Post-processing...");
+                // --- PARSING (АВТОМАТИЧЕСКОЕ ОПРЕДЕЛЕНИЕ СТРУКТУРЫ) ---
                 let num_rows = output0_shape[1] as usize; 
                 let num_anchors = output0_shape[2] as usize;
-                let num_classes = names_arc.len();
-                // Проверка на наличие масок (Box(4) + Classes + Coeffs(32))
-                let has_masks = output1_opt.is_some() && num_rows >= (4 + num_classes + MASK_COEFFS_NUM);
                 
+                // Определяем, есть ли маски, по наличию второго выхода
+                let has_masks = output1_opt.is_some();
+                
+                // ВАЖНО: Вычисляем количество классов математически, чтобы не зависеть от JSON
+                // Структура rows: [4 box coordinates] + [N classes] + [32 mask coeffs (optional)]
+                let num_classes = if has_masks {
+                    if num_rows > 36 { num_rows - 4 - 32 } else { 0 }
+                } else {
+                    if num_rows > 4 { num_rows - 4 } else { 0 }
+                };
+
+                // Индекс, где начинаются маски (последние 32 элемента)
+                let mask_start_idx = if has_masks { num_rows - 32 } else { 0 };
+
                 let mut candidates = Vec::new();
 
                 for i in 0..num_anchors {
                     let mut max_conf = 0.0f32;
                     let mut class_id = 0;
+                    
+                    // Классы идут с индекса 4
                     for c in 0..num_classes {
                         let conf = output0_data[(4 + c) * num_anchors + i];
                         if conf > max_conf { max_conf = conf; class_id = c; }
                     }
+                    
                     if max_conf > 0.25 {
                         let cx = output0_data[0 * num_anchors + i];
                         let cy = output0_data[1 * num_anchors + i];
                         let w = output0_data[2 * num_anchors + i];
                         let h = output0_data[3 * num_anchors + i];
                         
-                        let label = names_arc.get(class_id).cloned().unwrap_or_else(|| format!("{}", class_id));
-                        
+                        let label = if class_id < names_arc.len() {
+                            names_arc[class_id].clone()
+                        } else {
+                            format!("Class {}", class_id)
+                        };
+
                         let mut mask_coeffs = Vec::new();
                         if has_masks {
-                            let start_idx = 4 + num_classes;
-                            // Проверка границ массива, чтобы не упасть
-                            if (start_idx + MASK_COEFFS_NUM) * num_anchors + i < output0_data.len() {
-                                for m in 0..MASK_COEFFS_NUM {
-                                    mask_coeffs.push(output0_data[(start_idx + m) * num_anchors + i]);
+                            // Безопасное чтение масок
+                            for m in 0..MASK_COEFFS_NUM {
+                                let data_idx = (mask_start_idx + m) * num_anchors + i;
+                                if data_idx < output0_data.len() {
+                                    mask_coeffs.push(output0_data[data_idx]);
                                 }
                             }
+                        }
+
+                        // Если маски должны быть, но их не считали - не добавляем кандидата (чтобы не упасть)
+                        if has_masks && mask_coeffs.len() != MASK_COEFFS_NUM {
+                            continue;
                         }
 
                         candidates.push(Candidate {
@@ -265,14 +282,20 @@ impl YoloGuiApp {
                 let kept_indices = perform_nms_indices(&candidates, 0.45);
                 let final_detections: Vec<YoloEntityOutput> = kept_indices.iter().map(|&i| candidates[i].det.clone()).collect();
                 
-                println!("Detections: {}", final_detections.len());
+                println!("Objects found: {}", final_detections.len());
 
-                // 4. Mask Generation
+                // --- GENERATE MASKS ---
                 let mask_image = if has_masks && !kept_indices.is_empty() {
-                    if let Some((_, proto_data)) = output1_opt {
+                    if let Some((mask_dims, proto_data)) = output1_opt {
                         let kept_candidates: Vec<&Candidate> = kept_indices.iter().map(|&i| &candidates[i]).collect();
-                        println!("Generating mask texture...");
-                        Some(process_masks(&kept_candidates, &proto_data, (tw as usize, th as usize)))
+                        
+                        // Передаем динамические размеры маски (для 512x512 это будет 128x128)
+                        Some(process_masks(
+                            &kept_candidates, 
+                            &proto_data, 
+                            (tw as usize, th as usize), // Model input size (e.g. 512, 512)
+                            mask_dims                   // Mask proto size (e.g. 128, 128)
+                        ))
                     } else { None }
                 } else { None };
 
@@ -284,18 +307,13 @@ impl YoloGuiApp {
                 })
             };
 
-            // ГЛАВНОЕ ИСПРАВЛЕНИЕ: Отправляем результат или ошибку в UI
             match process() {
-                Ok(res) => {
-                    let _ = tx.send(AppMessage::Success(res));
-                    println!("--- Worker Finished Success ---");
-                },
-                Err(e) => {
-                    eprintln!("Worker Error: {}", e);
-                    let _ = tx.send(AppMessage::Error(e));
+                Ok(res) => { let _ = tx.send(AppMessage::Success(res)); },
+                Err(e) => { 
+                    eprintln!("Worker Panic/Error: {}", e);
+                    let _ = tx.send(AppMessage::Error(e)); 
                 }
             }
-            
             ctx.request_repaint();
         });
     }
@@ -306,14 +324,14 @@ impl YoloGuiApp {
                   let bytes = img_data.bytes.into_owned();
                   if let Some(rgba) = RgbaImage::from_raw(img_data.width as u32, img_data.height as u32, bytes) {
                       self.is_processing = true;
-                      self.status = "Обработка изображения...".to_string();
+                      self.status = "Обработка...".to_string();
                       self.run_worker(ImageInput::Pixels(DynamicImage::ImageRgba8(rgba)), ctx.clone());
                   }
              } else if let Ok(text) = cb.get_text() {
                  let path = PathBuf::from(text.trim_matches('"').trim());
                  if path.exists() {
                      self.is_processing = true;
-                     self.status = "Загрузка файла...".to_string();
+                     self.status = "Файл...".to_string();
                      self.run_worker(ImageInput::File(path), ctx.clone());
                  }
              }
@@ -321,47 +339,59 @@ impl YoloGuiApp {
    }
 }
 
-// --- ОТРИСОВКА МАСОК ---
+// --- ОТРИСОВКА МАСОК (ДИНАМИЧЕСКИЙ РАЗМЕР) ---
 fn process_masks(
     candidates: &[&Candidate], 
     proto_data: &[f32], 
-    model_size: (usize, usize) 
+    model_size: (usize, usize), // (512, 512) or (640, 640)
+    mask_proto_dim: (usize, usize) // (128, 128) or (160, 160)
 ) -> egui::ColorImage {
-    let (mw, mh) = (MASK_PROTO_SIZE, MASK_PROTO_SIZE); // 160
+    let (mw, mh) = mask_proto_dim;
     let proto_len = mw * mh;
 
-    let mut mask_buffer = ImageBuffer::<Rgba<u8>, Vec<u8>>::new(model_size.0 as u32, model_size.1 as u32);
+    // Буфер в разрешении масок
+    let mut mask_buffer = ImageBuffer::<Rgba<u8>, Vec<u8>>::new(mw as u32, mh as u32);
     
     let colors: Vec<[u8; 4]> = candidates.iter().map(|c| {
         let col = get_color_raw(&c.det.label);
-        [col[0], col[1], col[2], 200] 
+        [col[0], col[1], col[2], 220] 
     }).collect();
 
+    // Коэффициент масштаба (например, 128 / 512 = 0.25)
+    let scale_x = mw as f32 / model_size.0 as f32;
+    let scale_y = mh as f32 / model_size.1 as f32;
+
     for (idx, cand) in candidates.iter().enumerate() {
+        // Пропускаем, если коэффициенты не совпали (защита от краша)
+        if cand.mask_coeffs.len() != MASK_COEFFS_NUM { continue; }
+
         let b = &cand.det.bounding_box;
         let color = colors[idx];
         let coeffs = &cand.mask_coeffs;
 
-        if coeffs.len() != MASK_COEFFS_NUM { continue; } // Защита от битых данных
-
-        let x1 = b.x1.max(0.0) as u32;
-        let y1 = b.y1.max(0.0) as u32;
-        let x2 = b.x2.min(model_size.0 as f32) as u32;
-        let y2 = b.y2.min(model_size.1 as f32) as u32;
+        // BBox в координатах модели -> координаты маски
+        let x1 = (b.x1 * scale_x).floor().max(0.0) as u32;
+        let y1 = (b.y1 * scale_y).floor().max(0.0) as u32;
+        let x2 = (b.x2 * scale_x).ceil().min(mw as f32) as u32;
+        let y2 = (b.y2 * scale_y).ceil().min(mh as f32) as u32;
 
         if x2 <= x1 || y2 <= y1 { continue; }
 
         for y in y1..y2 {
             for x in x1..x2 {
-                let mx = ((x as f32 / model_size.0 as f32) * mw as f32) as usize;
-                let my = ((y as f32 / model_size.1 as f32) * mh as f32) as usize;
+                let offset = (y as usize) * mw + (x as usize);
                 
-                if mx >= mw || my >= mh { continue; }
+                // Защита от выхода за границы массива прототипов
+                if offset >= proto_data.len() / MASK_COEFFS_NUM { continue; }
 
-                let offset = my * mw + mx;
                 let mut sum = 0.0f32;
                 for k in 0..MASK_COEFFS_NUM {
-                    sum += coeffs[k] * proto_data[k * proto_len + offset];
+                    // Индекс в плоском массиве прототипов [32, H, W]
+                    // k-й канал, пиксель offset
+                    let proto_idx = k * proto_len + offset;
+                    if proto_idx < proto_data.len() {
+                        sum += coeffs[k] * proto_data[proto_idx];
+                    }
                 }
                 
                 let mask_val = 1.0 / (1.0 + (-sum).exp());
@@ -435,10 +465,8 @@ fn get_coco_names() -> Vec<String> {
         .iter().map(|s| s.to_string()).collect()
 }
 
-// --- ИНТЕРФЕЙС ---
 impl eframe::App for YoloGuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Прием сообщений от воркера (Успех или Ошибка)
         if let Ok(msg) = self.rx.try_recv() {
             match msg {
                 AppMessage::Success(res) => {
@@ -446,11 +474,9 @@ impl eframe::App for YoloGuiApp {
                     self.mask_texture = res.mask_texture.map(|m| ctx.load_texture("masks", m, egui::TextureOptions::LINEAR));
                     self.detections = res.detections;
                     self.img_size = res.img_size;
-                    self.status = format!("Готово. Найдено: {}", self.detections.len());
+                    self.status = format!("Найдено: {} | Маски: {}", self.detections.len(), if self.mask_texture.is_some() {"OK"} else {"-"});
                 },
-                AppMessage::Error(e) => {
-                    self.status = format!("Ошибка: {}", e);
-                }
+                AppMessage::Error(e) => self.status = format!("Ошибка: {}", e),
             }
             self.is_processing = false;
         }
@@ -514,10 +540,10 @@ impl eframe::App for YoloGuiApp {
                 egui::ScrollArea::both().show(ui, |ui| {
                     let (rect, resp) = ui.allocate_exact_size(display_size, egui::Sense::hover());
                     
-                    // 1. Рисуем Картинку
+                    // 1. Рисуем фото
                     ui.painter().image(tex.id(), rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
                     
-                    // 2. Рисуем Маски
+                    // 2. Рисуем МАСКИ (Overlay)
                     if let Some(m) = &self.mask_texture {
                         ui.painter().image(m.id(), rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
                     }
@@ -537,7 +563,7 @@ impl eframe::App for YoloGuiApp {
                     }
                     if h_id.is_some() { self.hovered_idx = h_id; }
 
-                    // 3. Рисуем ОБВОДКУ
+                    // 3. Рисуем ОБВОДКУ И ЗАЛИВКУ БОКСА
                     let p = ui.painter();
                     let sx = (self.img_size.x / self.model_input_size.0 as f32) * self.zoom;
                     let sy = (self.img_size.y / self.model_input_size.1 as f32) * self.zoom;
@@ -553,10 +579,13 @@ impl eframe::App for YoloGuiApp {
                             egui::pos2(b.x2 * sx, b.y2 * sy) + rect.min.to_vec2(),
                         );
                         
-                        // ОБВОДКА
+                        // А) ЗАЛИВКА БОКСА (Возвращена, 15% прозрачности)
+                        p.rect_filled(r, 0.0, c.linear_multiply(0.15));
+                        
+                        // Б) ОБВОДКА
                         p.rect_stroke(r, 0.0, egui::Stroke::new(if is_h {4.0} else {2.0}, c));
 
-                        // Текст (закругление только сверху)
+                        // В) ТЕКСТ (Сверху)
                         if is_h || self.zoom > 0.4 {
                              let t = format!("{} {:.0}%", d.label, d.confidence * 100.0);
                              let f = egui::FontId::proportional((13.0*self.zoom).clamp(10.0, 24.0));
