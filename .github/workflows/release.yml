@@ -1,0 +1,125 @@
+name: Release
+
+on:
+  workflow_dispatch:
+  
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  formating_code:
+    runs-on: ubuntu-latest
+    permissions: write-all
+    name: Formating code
+    steps:
+      - uses: actions/checkout@v4
+      - name: Formating code
+        run: cargo fmt
+      - name: Commit changes
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add .
+          git commit -m "Auto format code" || echo "No changes to commit"
+          git push || echo "No changes to push"
+
+  build_linux:
+    runs-on: ubuntu-latest
+    permissions: write-all
+    name: Build Linux
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build linux
+        run: cargo build --release
+      - name: Move linux binaries
+        run: |
+          mv target/release/yolo-viewer Linux-yolo-viewer
+      - name: Upload Linux artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-binaries
+          path: |
+  build_windows:
+    runs-on: windows-latest
+    permissions: write-all
+    name: Build Windows
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build windows
+        run: cargo build --release
+      - name: Move windows binaries
+        run: |
+          move target\release\yolo-viewer.exe Windows-yolo-viewer.exe
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-binaries
+          path: |
+            Windows-yolo-viewer.exe
+  build_macos_arm64:
+    runs-on: macos-latest
+    permissions: write-all
+    name: Build MacOS Arm64
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build macos
+        run: cargo build --release
+      - name: Move macos binaries
+        run: |
+          mv target/release/yolo-viewer MacOS-Arm64-yolo-viewer
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-binaries-arm64
+          path: |
+            MacOS-Arm64-yolo-viewer
+  create_release:
+    needs: [build_linux, build_windows, build_macos_arm64]
+    runs-on: ubuntu-latest
+    name: Create Release
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download Linux artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-binaries
+          path: linux-binaries
+      - name: Download Windows artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-binaries
+          path: windows-binaries
+      - name: Download MacOS artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: macos-binaries-arm64
+          path: macos-binaries-arm64
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ env.APP_VERSION }}
+          name: 🌟 Cross Cleaner ${{ env.APP_VERSION }} 🌟
+          body: |
+            ![Downloads](https://img.shields.io/github/downloads/WinBooster/Cross-Cleaner/v${{ env.APP_VERSION }}/total) ![Version](https://img.shields.io/badge/version-${{ env.APP_VERSION }}-blue) ![Platform](https://img.shields.io/badge/platform-Windows%20|%20Linux-orange)
+
+            ## ✨ What's New
+
+            ### 🪟 Windows Enhancements
+            - **Java** Fix incorrect clearings
+
+            ## 👏 Contributors Hall of Fame
+            Special thanks to our amazing contributors who made this release possible:
+            - **@Nekiplay** - Core improvements and feature implementations
+
+            ---
+            *Thank you for using Cross Cleaner! Your system, cleaner than ever.*
+          files: |
+            linux-binaries/Linux-Cross_Cleaner_CLI
+            linux-binaries/Linux-Cross_Cleaner_GUI
+            macos-binaries-arm64/MacOS-Arm64-Cross_Cleaner_CLI
+            macos-binaries-arm64/MacOS-Arm64-Cross_Cleaner_GUI
+            windows-binaries/Windows-Cross_Cleaner_CLI.exe
+            windows-binaries/Windows-Cross_Cleaner_GUI.exe
