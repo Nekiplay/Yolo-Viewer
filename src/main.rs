@@ -4,18 +4,16 @@
 )]
 
 use eframe::egui;
-use image::{DynamicImage, RgbaImage, ImageBuffer, Rgba};
+use image::{DynamicImage, RgbaImage, ImageBuffer, Rgba, Luma, imageops::FilterType};
 use std::sync::{Arc, Mutex, mpsc};
 use std::path::PathBuf;
 use std::collections::HashMap;
 use ort::value::{Value, ValueType};
 use yolo_rs::{YoloEntityOutput, model, BoundingBox};
 
-// --- КОНСТАНТЫ ---
 const MASK_PROTO_SIZE: usize = 160;
 const MASK_COEFFS_NUM: usize = 32;
 
-// --- ТИПЫ ---
 enum ImageInput {
     File(PathBuf),
     Pixels(DynamicImage),
@@ -32,6 +30,7 @@ struct DetectionResult {
 struct Candidate {
     det: YoloEntityOutput,
     mask_coeffs: Vec<f32>,
+    #[allow(dead_code)]
     class_id: usize,
 }
 
@@ -48,9 +47,12 @@ struct YoloGuiApp {
     texture: Option<egui::TextureHandle>,
     mask_texture: Option<egui::TextureHandle>,
     detections: Vec<YoloEntityOutput>,
-    img_size: egui::Vec2,
+    img_size: egui::Vec2, 
     
     zoom: f32,
+    pan: egui::Vec2,
+    fit_to_screen_req: bool,
+
     hovered_idx: Option<usize>,
     
     tx: mpsc::Sender<AppMessage>,
@@ -117,6 +119,8 @@ impl YoloGuiApp {
             detections: Vec::new(),
             img_size: egui::Vec2::ZERO,
             zoom: 1.0,
+            pan: egui::Vec2::ZERO,
+            fit_to_screen_req: false,
             hovered_idx: None,
             tx, rx,
             is_processing: false,
@@ -156,7 +160,6 @@ impl YoloGuiApp {
             }
             Err(e) => { 
                 self.status = format!("Ошибка: {:?}", e); 
-                eprintln!("Load Error: {:?}", e);
             }
         }
     }
@@ -200,7 +203,6 @@ impl YoloGuiApp {
                     
                     let out1 = if outputs.len() > 1 {
                          let (s1, d1) = outputs[1].try_extract_tensor::<f32>().map_err(|e| e.to_string())?;
-                         // (width, height) маски
                          let mask_dims = (s1[3] as usize, s1[2] as usize); 
                          Some((mask_dims, d1.to_vec()))
                     } else { None };
@@ -212,7 +214,6 @@ impl YoloGuiApp {
                 let num_anchors = output0_shape[2] as usize;
                 let has_masks = output1_opt.is_some();
                 
-                // Авто-определение количества классов
                 let num_classes = if has_masks {
                     if num_rows > 36 { num_rows - 4 - 32 } else { 0 }
                 } else {
@@ -316,7 +317,6 @@ impl YoloGuiApp {
    }
 }
 
-// --- ГЕНЕРАЦИЯ МАСКИ ---
 fn process_masks(
     candidates: &[&Candidate], 
     proto_data: &[f32], 
@@ -324,59 +324,98 @@ fn process_masks(
     mask_proto_dim: (usize, usize) 
 ) -> egui::ColorImage {
     let (mw, mh) = mask_proto_dim;
+    let (tw, th) = model_size;
     let proto_len = mw * mh;
 
-    let mut mask_buffer = ImageBuffer::<Rgba<u8>, Vec<u8>>::new(mw as u32, mh as u32);
-    
-    // ЦВЕТА И ПРОЗРАЧНОСТЬ
-    // Alpha = 100 (более прозрачная маска, примерно 40%)
-    let colors: Vec<[u8; 4]> = candidates.iter().map(|c| {
-        let col = get_color_raw(&c.det.label);
-        [col[0], col[1], col[2], 100] 
-    }).collect();
+    const SCALE_FACTOR: f32 = 4.0; 
+    let super_w = (tw as f32 * SCALE_FACTOR) as u32;
+    let super_h = (th as f32 * SCALE_FACTOR) as u32;
 
-    let scale_x = mw as f32 / model_size.0 as f32;
-    let scale_y = mh as f32 / model_size.1 as f32;
+    let mut final_buffer = ImageBuffer::<Rgba<u8>, Vec<u8>>::new(super_w, super_h);
+  
+    let scale_x_proto = mw as f32 / tw as f32;
+    let scale_y_proto = mh as f32 / th as f32;
 
-    for (idx, cand) in candidates.iter().enumerate() {
+    for cand in candidates.iter() {
         if cand.mask_coeffs.len() != MASK_COEFFS_NUM { continue; }
 
         let b = &cand.det.bounding_box;
-        let color = colors[idx];
-        let coeffs = &cand.mask_coeffs;
+        
+        let mx1 = (b.x1 * scale_x_proto).floor().max(0.0) as u32;
+        let my1 = (b.y1 * scale_y_proto).floor().max(0.0) as u32;
+        let mx2 = (b.x2 * scale_x_proto).ceil().min(mw as f32) as u32;
+        let my2 = (b.y2 * scale_y_proto).ceil().min(mh as f32) as u32;
 
-        let x1 = (b.x1 * scale_x).floor().max(0.0) as u32;
-        let y1 = (b.y1 * scale_y).floor().max(0.0) as u32;
-        let x2 = (b.x2 * scale_x).ceil().min(mw as f32) as u32;
-        let y2 = (b.y2 * scale_y).ceil().min(mh as f32) as u32;
+        if mx2 <= mx1 || my2 <= my1 { continue; }
+        
+        let patch_w = mx2 - mx1;
+        let patch_h = my2 - my1;
 
-        if x2 <= x1 || y2 <= y1 { continue; }
-
-        for y in y1..y2 {
-            for x in x1..x2 {
+        let mut float_patch = ImageBuffer::<Luma<f32>, Vec<f32>>::new(patch_w, patch_h);
+        
+        for py in 0..patch_h {
+            for px in 0..patch_w {
+                let y = my1 + py;
+                let x = mx1 + px;
                 let offset = (y as usize) * mw + (x as usize);
-                if offset >= proto_data.len() / MASK_COEFFS_NUM { continue; }
+                
+                if offset * MASK_COEFFS_NUM >= proto_data.len() { continue; }
 
                 let mut sum = 0.0f32;
                 for k in 0..MASK_COEFFS_NUM {
                     let proto_idx = k * proto_len + offset;
-                    if proto_idx < proto_data.len() {
-                        sum += coeffs[k] * proto_data[proto_idx];
-                    }
+                    sum += cand.mask_coeffs[k] * proto_data[proto_idx];
                 }
-                
-                let mask_val = 1.0 / (1.0 + (-sum).exp());
+                let val = 1.0 / (1.0 + (-sum).exp());
+                float_patch.put_pixel(px, py, Luma([val]));
+            }
+        }
 
-                if mask_val > 0.5 {
-                    mask_buffer.put_pixel(x, y, Rgba(color));
+        let target_x1 = (b.x1 * SCALE_FACTOR).max(0.0) as u32;
+        let target_y1 = (b.y1 * SCALE_FACTOR).max(0.0) as u32;
+        
+        let target_x2 = (b.x2 * SCALE_FACTOR).min(super_w as f32) as u32;
+        let target_y2 = (b.y2 * SCALE_FACTOR).min(super_h as f32) as u32;
+        
+        let target_w = target_x2.saturating_sub(target_x1);
+        let target_h = target_y2.saturating_sub(target_y1);
+
+        if target_w == 0 || target_h == 0 { continue; }
+
+        let resized_patch = image::imageops::resize(
+            &float_patch, 
+            target_w, 
+            target_h, 
+            FilterType::Triangle 
+        );
+
+        let col_rgb = get_color_raw(&cand.det.label);
+        
+        for py in 0..target_h {
+            for px in 0..target_w {
+                let val = resized_patch.get_pixel(px, py)[0];
+                
+                if val > 0.5 {
+                    let gx = target_x1 + px;
+                    let gy = target_y1 + py;
+                    
+                    if gx < super_w && gy < super_h {
+                        // Anti-aliasing
+                        let alpha = ((val - 0.5) * 2.0 * 180.0).clamp(0.0, 180.0) as u8;
+                        
+                        let pixel = final_buffer.get_pixel_mut(gx, gy);
+                        if pixel[3] < alpha {
+                            *pixel = Rgba([col_rgb[0], col_rgb[1], col_rgb[2], alpha]);
+                        }
+                    }
                 }
             }
         }
     }
     
     egui::ColorImage::from_rgba_unmultiplied(
-        [mask_buffer.width() as _, mask_buffer.height() as _], 
-        mask_buffer.as_flat_samples().as_slice()
+        [final_buffer.width() as _, final_buffer.height() as _], 
+        final_buffer.as_flat_samples().as_slice()
     )
 }
 
@@ -431,22 +470,18 @@ fn load_egui_image(img: &DynamicImage) -> egui::ColorImage {
     egui::ColorImage::from_rgba_unmultiplied(size, img.to_rgba8().as_flat_samples().as_slice())
 }
 
-fn get_coco_names() -> Vec<String> {
-    vec!["person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat", "traffic light", "fire hydrant", "stop sign", "parking meter", "bench", "bird", "cat", "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra", "giraffe", "backpack", "umbrella", "handbag", "tie", "suitcase", "frisbee", "skis", "snowboard", "sports ball", "kite", "baseball bat", "baseball glove", "skateboard", "surfboard", "tennis racket", "bottle", "wine glass", "cup", "fork", "knife", "spoon", "bowl", "banana", "apple", "sandwich", "orange", "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair", "couch", "potted plant", "bed", "dining table", "toilet", "tv", "laptop", "mouse", "remote", "keyboard", "cell phone", "microwave", "oven", "toaster", "sink", "refrigerator", "book", "clock", "vase", "scissors", "teddy bear", "hair drier", "toothbrush"]
-        .iter().map(|s| s.to_string()).collect()
-}
-
-// --- UI ---
 impl eframe::App for YoloGuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if let Ok(msg) = self.rx.try_recv() {
             match msg {
                 AppMessage::Success(res) => {
                     self.texture = Some(ctx.load_texture("img", res.texture_data, Default::default()));
+                    // Текстура теперь высокого разрешения (1280x1280), ставим LINEAR чтобы при уменьшении было красиво
                     self.mask_texture = res.mask_texture.map(|m| ctx.load_texture("masks", m, egui::TextureOptions::LINEAR));
                     self.detections = res.detections;
                     self.img_size = res.img_size;
                     self.status = format!("Найдено: {} | Маски: {}", self.detections.len(), if self.mask_texture.is_some() {"OK"} else {"-"});
+                    self.fit_to_screen_req = true;
                 },
                 AppMessage::Error(e) => self.status = format!("Ошибка: {}", e),
             }
@@ -458,7 +493,8 @@ impl eframe::App for YoloGuiApp {
              if let Some(d) = dropped {
                  if let Some(path) = d.path {
                     if let Some(ext) = path.extension() {
-                        if ext.to_string_lossy().to_lowercase() == "onnx" {
+                        let ext_str = ext.to_string_lossy().to_lowercase();
+                        if ext_str == "onnx" {
                             self.load_model(path);
                         } else if self.model_session.is_some() {
                             self.is_processing = true;
@@ -468,12 +504,10 @@ impl eframe::App for YoloGuiApp {
                  }
              }
         }
+        
         if ctx.input_mut(|i| i.consume_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::V))) {
             if self.model_session.is_some() { self.handle_clipboard(ctx); }
         }
-
-        let z_delta = ctx.input(|i| i.zoom_delta());
-        if z_delta != 1.0 { self.zoom = (self.zoom * z_delta).clamp(0.1, 20.0); }
 
         egui::SidePanel::right("side").width_range(160.0..=250.0).show(ctx, |ui| {
             ui.heading("Объекты");
@@ -508,68 +542,90 @@ impl eframe::App for YoloGuiApp {
             }
 
             if let Some(tex) = &self.texture {
-                let display_size = self.img_size * self.zoom;
-                egui::ScrollArea::both().show(ui, |ui| {
-                    let (rect, resp) = ui.allocate_exact_size(display_size, egui::Sense::hover());
-                    
-                    // 1. Рисуем фото
-                    ui.painter().image(tex.id(), rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
-                    
-                    // 2. Рисуем МАСКИ (Заливка объекта)
-                    if let Some(m) = &self.mask_texture {
-                        ui.painter().image(m.id(), rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
-                    }
+                let (response, painter) = ui.allocate_painter(ui.available_size(), egui::Sense::click_and_drag());
+                let viewport_rect = response.rect;
 
-                    let mut h_id = None;
-                    if let Some(ptr) = resp.hover_pos() {
-                        let sx = (self.img_size.x / self.model_input_size.0 as f32) * self.zoom;
-                        let sy = (self.img_size.y / self.model_input_size.1 as f32) * self.zoom;
-                        for (i, d) in self.detections.iter().enumerate().rev() {
-                            let b = &d.bounding_box;
-                            let r = egui::Rect::from_min_max(
-                                egui::pos2(b.x1 * sx, b.y1 * sy) + rect.min.to_vec2(),
-                                egui::pos2(b.x2 * sx, b.y2 * sy) + rect.min.to_vec2(),
-                            );
-                            if r.contains(ptr) { h_id = Some(i); break; }
+                if self.fit_to_screen_req {
+                    let w_ratio = viewport_rect.width() / self.img_size.x;
+                    let h_ratio = viewport_rect.height() / self.img_size.y;
+                    self.zoom = w_ratio.min(h_ratio) * 0.95;
+                    let content_size = self.img_size * self.zoom;
+                    self.pan = viewport_rect.min.to_vec2() + (viewport_rect.size() - content_size) / 2.0;
+                    self.fit_to_screen_req = false;
+                }
+
+                let scroll_delta = ctx.input(|i| i.raw_scroll_delta);
+                if scroll_delta.y != 0.0 {
+                    if let Some(mouse_pos) = ctx.input(|i| i.pointer.hover_pos()) {
+                        if viewport_rect.contains(mouse_pos) {
+                            let zoom_factor = if scroll_delta.y > 0.0 { 1.1 } else { 0.9 };
+                            let old_zoom = self.zoom;
+                            let new_zoom = (self.zoom * zoom_factor).clamp(0.05, 50.0);
+                            let mouse_vec = mouse_pos.to_vec2();
+                            self.pan = mouse_vec - (mouse_vec - self.pan) * (new_zoom / old_zoom);
+                            self.zoom = new_zoom;
                         }
                     }
-                    if h_id.is_some() { self.hovered_idx = h_id; }
+                }
 
-                    // 3. Рисуем БОКСЫ (Только контур!)
-                    let p = ui.painter();
-                    let sx = (self.img_size.x / self.model_input_size.0 as f32) * self.zoom;
-                    let sy = (self.img_size.y / self.model_input_size.1 as f32) * self.zoom;
-                    
-                    for (i, d) in self.detections.iter().enumerate() {
-                        let b = &d.bounding_box;
-                        let col = get_color(&d.label);
-                        let is_h = self.hovered_idx == Some(i);
-                        let c = if is_h { col.linear_multiply(1.5) } else { col };
-                        
-                        let r = egui::Rect::from_min_max(
-                            egui::pos2(b.x1 * sx, b.y1 * sy) + rect.min.to_vec2(),
-                            egui::pos2(b.x2 * sx, b.y2 * sy) + rect.min.to_vec2(),
-                        );
-                        
-                        // А) Обводка (Stroke)
-                        // Заливка (Fill) НЕ используется, чтобы видеть только маску
-                        p.rect_stroke(r, 0.0, egui::Stroke::new(if is_h {4.0} else {2.0}, c));
+                if response.dragged_by(egui::PointerButton::Primary) || response.dragged_by(egui::PointerButton::Middle) {
+                    self.pan += response.drag_delta();
+                }
 
-                        // Б) Текст (с закруглением только сверху)
+                let displayed_rect = egui::Rect::from_min_size(self.pan.to_pos2(), self.img_size * self.zoom);
+                let painter = painter.with_clip_rect(viewport_rect);
+
+                painter.image(tex.id(), displayed_rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
+                
+                if let Some(m) = &self.mask_texture {
+                    painter.image(m.id(), displayed_rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
+                }
+
+                let mut h_id = None;
+                if let Some(ptr) = response.hover_pos() {
+                    let relative_pos = (ptr - self.pan) / self.zoom;
+                    if relative_pos.x >= 0.0 && relative_pos.y >= 0.0 && relative_pos.x <= self.img_size.x && relative_pos.y <= self.img_size.y {
+                           let sx = self.img_size.x / self.model_input_size.0 as f32;
+                           let sy = self.img_size.y / self.model_input_size.1 as f32;
+                           for (i, d) in self.detections.iter().enumerate().rev() {
+                               let b = &d.bounding_box;
+                               let bx1 = b.x1 * sx; let by1 = b.y1 * sy;
+                               let bx2 = b.x2 * sx; let by2 = b.y2 * sy;
+                               if relative_pos.x >= bx1 && relative_pos.x <= bx2 && relative_pos.y >= by1 && relative_pos.y <= by2 {
+                                   h_id = Some(i);
+                                   break;
+                               }
+                           }
+                       }
+                }
+                if h_id.is_some() { self.hovered_idx = h_id; }
+
+                let sx = (self.img_size.x / self.model_input_size.0 as f32) * self.zoom;
+                let sy = (self.img_size.y / self.model_input_size.1 as f32) * self.zoom;
+
+                for (i, d) in self.detections.iter().enumerate() {
+                    let b = &d.bounding_box;
+                    let col = get_color(&d.label);
+                    let is_h = self.hovered_idx == Some(i);
+                    let c = if is_h { col.linear_multiply(1.5) } else { col };
+                    let r = egui::Rect::from_min_max(
+                        self.pan.to_pos2() + egui::vec2(b.x1 * sx, b.y1 * sy),
+                        self.pan.to_pos2() + egui::vec2(b.x2 * sx, b.y2 * sy),
+                    );
+                    if painter.clip_rect().intersects(r) {
+                        painter.rect_stroke(r, 0.0, egui::Stroke::new(if is_h {3.0} else {1.5}, c));
                         if is_h || self.zoom > 0.4 {
                              let t = format!("{} {:.0}%", d.label, d.confidence * 100.0);
                              let f = egui::FontId::proportional((13.0*self.zoom).clamp(10.0, 24.0));
-                             let g = p.layout_no_wrap(t, f, egui::Color32::WHITE);
+                             let g = painter.layout_no_wrap(t, f, egui::Color32::WHITE);
                              let mut lp = r.min;
-                             if lp.y - g.size().y - 6.0 < rect.min.y { lp.y += 2.0; } else { lp.y -= g.size().y + 4.0; }
+                             if lp.y - g.size().y - 6.0 < displayed_rect.min.y { lp.y += 2.0; } else { lp.y -= g.size().y + 4.0; }
                              let lr = egui::Rect::from_min_size(lp, g.size() + egui::vec2(8.0, 4.0));
-                             
-                             let rounding = egui::Rounding { nw: 4.0, ne: 4.0, sw: 0.0, se: 0.0 };
-                             p.rect_filled(lr, rounding, c);
-                             p.galley(lr.min + egui::vec2(4.0, 2.0), g, egui::Color32::WHITE);
+                             painter.rect_filled(lr, egui::Rounding::same(4.0), c);
+                             painter.galley(lr.min + egui::vec2(4.0, 2.0), g, egui::Color32::WHITE);
                         }
                     }
-                });
+                }
             } else {
                 ui.centered_and_justified(|ui| ui.label("Перетащите картинку или Ctrl+V"));
             }
