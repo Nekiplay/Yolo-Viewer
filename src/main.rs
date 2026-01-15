@@ -129,8 +129,8 @@ impl YoloGuiApp {
 
         let (tx, rx) = mpsc::channel();
         let status = loaded_path
-            .map(|n| format!("Модель: {}", n))
-            .unwrap_or_else(|| "Перетащите .onnx файл".to_string());
+            .map(|n| format!("Model: {}", n))
+            .unwrap_or_else(|| "Drag and drop the .onnx file".to_string());
 
         Self {
             model_session: session,
@@ -192,11 +192,11 @@ impl YoloGuiApp {
                 self.model_session = Some(Arc::new(Mutex::new(s)));
                 self.model_input_size = size;
                 self.class_names = Arc::new(names);
-                self.status = format!("Загружено: {:?}", path.file_name().unwrap());
+                self.status = format!("Loaded: {:?}", path.file_name().unwrap());
                 println!("Вход модели: {:?}", size);
             }
             Err(e) => {
-                self.status = format!("Ошибка: {:?}", e);
+                self.status = format!("Error: {:?}", e);
             }
         }
     }
@@ -329,7 +329,7 @@ impl YoloGuiApp {
                     .map(|&i| candidates[i].det.clone())
                     .collect();
 
-                println!("Найдены объекты: {}", final_detections.len());
+                println!("Objects found: {}", final_detections.len());
 
                 let mask_image = if has_masks && !kept_indices.is_empty() {
                     if let Some((mask_dims, proto_data)) = output1_opt {
@@ -590,7 +590,7 @@ impl eframe::App for YoloGuiApp {
                     self.detections = res.detections;
                     self.img_size = res.img_size;
                     self.status = format!(
-                        "Найдено: {} | Маски: {}",
+                        "Founded: {} | Mask: {}",
                         self.detections.len(),
                         if self.mask_texture.is_some() {
                             "OK"
@@ -600,7 +600,7 @@ impl eframe::App for YoloGuiApp {
                     );
                     self.fit_to_screen_req = true;
                 }
-                AppMessage::Error(e) => self.status = format!("Ошибка: {}", e),
+                AppMessage::Error(e) => self.status = format!("Error: {}", e),
             }
             self.is_processing = false;
         }
@@ -634,9 +634,9 @@ impl eframe::App for YoloGuiApp {
         }
 
         egui::SidePanel::right("side")
-            .width_range(160.0..=250.0)
+            .width_range(160.0..=350.0)
             .show(ctx, |ui| {
-                ui.heading("Объекты");
+                ui.heading("Objects");
                 ui.separator();
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     let mut lh = None;
@@ -675,7 +675,7 @@ impl eframe::App for YoloGuiApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             if self.model_session.is_none() {
                 ui.centered_and_justified(|ui| {
-                    ui.heading("Загрузите модель (перетащите .onnx)");
+                    ui.heading("Upload the model (drag and drop .onnx)");
                 });
                 return;
             }
@@ -802,7 +802,7 @@ impl eframe::App for YoloGuiApp {
                     }
                 }
             } else {
-                ui.centered_and_justified(|ui| ui.label("Перетащите картинку или Ctrl+V"));
+                ui.centered_and_justified(|ui| ui.label("Drag and drop the image"));
             }
         });
     }
