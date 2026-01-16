@@ -2,11 +2,14 @@ pub mod app;
 pub mod utils;
 pub mod inference;
 pub mod loading;
+pub mod database;
 
 use image::{DynamicImage};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, mpsc};
 use yolo_rs::YoloEntityOutput;
+
+use crate::database::ModelSettings;
 
 #[derive(Clone)]
 pub struct Candidate {
@@ -50,4 +53,7 @@ pub struct YoloGuiApp {
     pub rx: mpsc::Receiver<AppMessage>,
     pub is_processing: bool,
     pub status: String,
+    pub settings: ModelSettings,
+    pub database: Option<Arc<Mutex<crate::database::SettingsDatabase>>>,
+    pub show_settings_window: bool,
 }

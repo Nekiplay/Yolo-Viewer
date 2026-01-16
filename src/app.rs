@@ -4,9 +4,31 @@ use std::sync::{Arc, Mutex, mpsc};
 
 use crate::{DetectionResult, ImageInput, AppMessage, YoloGuiApp, Candidate};
 use crate::utils;
+use crate::database::{SettingsDatabase, ModelSettings};
 
 impl YoloGuiApp {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+        // Initialize database and load settings first
+        let database = match SettingsDatabase::new() {
+            Ok(db) => Some(Arc::new(Mutex::<SettingsDatabase>::new(db))),
+            Err(e) => {
+                eprintln!("Failed to initialize database: {}", e);
+                None
+            }
+        };
+
+        let settings = if let Some(db) = &database {
+            match db.lock().unwrap().get_settings() {
+                Ok(settings) => settings,
+                Err(e) => {
+                    eprintln!("Failed to load settings: {}", e);
+                    ModelSettings::default()
+                }
+            }
+        } else {
+            ModelSettings::default()
+        };
+
         let default_models = [
             "best.onnx",
             "yolo11n-seg.onnx",
@@ -22,8 +44,9 @@ impl YoloGuiApp {
             if path.exists() {
                 println!("Auto-loading: {:?}", path);
                 if let Ok(mut s) = yolo_rs::model::YoloModelSession::from_filename_v8(&path) {
-                    s.probability_threshold = Some(0.25);
-                    s.iou_threshold = Some(0.45);
+                    // Use settings from database
+                    s.probability_threshold = Some(settings.probability_threshold);
+                    s.iou_threshold = Some(settings.iou_threshold);
                     session = Some(Arc::new(Mutex::new(s)));
                     loaded_path = Some(name.to_string());
                     break;
@@ -71,6 +94,7 @@ impl YoloGuiApp {
         };
 
         let (tx, rx) = mpsc::channel();
+
         let status = loaded_path
             .map(|n| format!("Model: {}", n))
             .unwrap_or_else(|| "Drag and drop the .onnx file".to_string());
@@ -91,6 +115,9 @@ impl YoloGuiApp {
             rx,
             is_processing: false,
             status,
+            settings,
+            database,
+            show_settings_window: false,
         }
     }
 
@@ -98,8 +125,9 @@ impl YoloGuiApp {
         println!("Загрузка: {:?}", path);
         match yolo_rs::model::YoloModelSession::from_filename_v8(&path) {
             Ok(mut s) => {
-                s.probability_threshold = Some(0.25);
-                s.iou_threshold = Some(0.45);
+                // Use settings from database
+                s.probability_threshold = Some(self.settings.probability_threshold);
+                s.iou_threshold = Some(self.settings.iou_threshold);
                 let size = if let Some(input) = s.session.inputs.first() {
                     if let ort::value::ValueType::Tensor { shape, .. } = &input.input_type {
                         (shape[3] as u32, shape[2] as u32)
@@ -427,12 +455,62 @@ impl eframe::App for YoloGuiApp {
 
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
             ui.horizontal(|ui| {
+                // Add settings icon button on the left
+                if ui.button("⚙").clicked() {
+                    self.show_settings_window = !self.show_settings_window;
+                }
+
                 if self.is_processing {
                     ui.spinner();
                 }
-                ui.label(&self.status);
+                ui.label(" ".to_owned() + &self.status);
             });
         });
+
+        // Settings window
+        if self.show_settings_window {
+            egui::Window::new("Model Settings")
+                .open(&mut self.show_settings_window)
+                .show(ctx, |ui| {
+                    ui.label("Detection Thresholds:");
+                    ui.horizontal(|ui| {
+                        ui.label("Probability:");
+                        let mut prob = self.settings.probability_threshold;
+                        if ui.add(egui::Slider::new(&mut prob, 0.0..=1.0)).changed() {
+                            self.settings.probability_threshold = prob;
+                            if let Some(db) = &self.database {
+                                if let Ok(db_lock) = db.lock() {
+                                    let _ = db_lock.save_settings(&self.settings);
+                                }
+                            }
+                        }
+                        ui.label(format!("{:.2}", prob));
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.label("IoU:");
+                        let mut iou = self.settings.iou_threshold;
+                        if ui.add(egui::Slider::new(&mut iou, 0.0..=1.0)).changed() {
+                            self.settings.iou_threshold = iou;
+                            if let Some(db) = &self.database {
+                                if let Ok(db_lock) = db.lock() {
+                                    let _ = db_lock.save_settings(&self.settings);
+                                }
+                            }
+                        }
+                        ui.label(format!("{:.2}", iou));
+                    });
+
+                    if ui.button("Reset to Defaults").clicked() {
+                        self.settings = ModelSettings::default();
+                        if let Some(db) = &self.database {
+                            if let Ok(db_lock) = db.lock() {
+                                let _ = db_lock.save_settings(&self.settings);
+                            }
+                        }
+                    }
+                });
+        }
 
         egui::CentralPanel::default().show(ctx, |ui| {
             if self.model_session.is_none() {
