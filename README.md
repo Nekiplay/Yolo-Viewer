@@ -21,9 +21,8 @@ A high-performance, lightweight graphical interface for visualizing and testing 
 ## 🛠 Tech Stack
 
 *   **Core:** [Rust](https://www.rust-lang.org/)
-*   **Inference Engine:** [ONNX Runtime (ort)](https://github.com/pykeio/ort))
+*   **Inference Engine:** [ONNX Runtime (ort)](https://github.com/pykeio/ort)
 *   **GUI Framework:** [egui](https://github.com/emilk/egui)
-*   **Computer Vision:** [image-rs](https://github.com/image-rs/image)
 
 ## 🚀 Quick Start
 
