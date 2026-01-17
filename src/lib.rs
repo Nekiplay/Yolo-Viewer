@@ -56,4 +56,9 @@ pub struct YoloGuiApp {
     pub settings: ModelSettings,
     pub database: Option<Arc<Mutex<crate::database::SettingsDatabase>>>,
     pub show_settings_window: bool,
+    // Hot reload fields
+    pub db_watcher: Option<notify::RecommendedWatcher>,
+    pub db_event_rx: Option<mpsc::Receiver<notify::Event>>,
+    pub last_db_mtime: Option<std::time::SystemTime>,
+    pub last_check_time: Option<std::time::Instant>,
 }

@@ -1,6 +1,8 @@
 use eframe::egui;
+use notify::{Watcher, RecursiveMode};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, mpsc};
+use std::time::Duration;
 
 use crate::{DetectionResult, ImageInput, AppMessage, YoloGuiApp, Candidate};
 use crate::utils;
@@ -8,7 +10,6 @@ use crate::database::{SettingsDatabase, ModelSettings};
 
 impl YoloGuiApp {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
-        // Initialize database and load settings first
         let database = match SettingsDatabase::new() {
             Ok(db) => Some(Arc::new(Mutex::<SettingsDatabase>::new(db))),
             Err(e) => {
@@ -29,6 +30,13 @@ impl YoloGuiApp {
             ModelSettings::default()
         };
 
+        let db_path = PathBuf::from("yolo_settings.db");
+        let (db_watcher, db_event_rx) = if db_path.exists() {
+            Self::init_db_watcher(&db_path)
+        } else {
+            (None, None)
+        };
+
         let default_models = [
             "best.onnx",
             "yolo11n-seg.onnx",
@@ -44,7 +52,6 @@ impl YoloGuiApp {
             if path.exists() {
                 println!("Auto-loading: {:?}", path);
                 if let Ok(mut s) = yolo_rs::model::YoloModelSession::from_filename_v8(&path) {
-                    // Use settings from database
                     s.probability_threshold = Some(settings.probability_threshold);
                     s.iou_threshold = Some(settings.iou_threshold);
                     session = Some(Arc::new(Mutex::new(s)));
@@ -118,14 +125,75 @@ impl YoloGuiApp {
             settings,
             database,
             show_settings_window: false,
+            db_watcher,
+            db_event_rx,
+            last_db_mtime: std::fs::metadata("yolo_settings.db").and_then(|m| m.modified()).ok(),
+            last_check_time: None,
+        }
+    }
+
+    fn init_db_watcher(db_path: &PathBuf) -> (Option<notify::RecommendedWatcher>, Option<mpsc::Receiver<notify::Event>>) {
+        let (tx, rx) = mpsc::channel();
+        match notify::RecommendedWatcher::new(
+            move |result: Result<notify::Event, notify::Error>| {
+                if let Ok(event) = result {
+                    if matches!(event.kind, notify::EventKind::Modify(_)) {
+                        let _ = tx.send(event);
+                    }
+                }
+            },
+            notify::Config::default().with_poll_interval(Duration::from_millis(500)),
+        ) {
+            Ok(mut watcher) => {
+                if let Err(e) = watcher.watch(db_path, RecursiveMode::NonRecursive) {
+                    eprintln!("Failed to watch database file: {}", e);
+                    return (None, None);
+                }
+                println!("Watching database for changes: {:?}", db_path);
+                (Some(watcher), Some(rx))
+            }
+            Err(e) => {
+                eprintln!("Failed to create file watcher: {}", e);
+                (None, None)
+            }
+        }
+    }
+
+    fn update_model_parameters(&self) {
+        if let Some(model) = &self.model_session {
+            let mut guard = model.lock().unwrap();
+            guard.probability_threshold = Some(self.settings.probability_threshold);
+            guard.iou_threshold = Some(self.settings.iou_threshold);
+            println!("Model parameters updated: prob={:.2}, iou={:.2}",
+                     self.settings.probability_threshold,
+                     self.settings.iou_threshold);
+        }
+    }
+
+    fn reload_settings_from_db(&mut self) {
+        if let Some(db) = &self.database {
+            match db.lock().unwrap().get_settings() {
+                Ok(new_settings) => {
+                    if self.settings.probability_threshold != new_settings.probability_threshold
+                        || self.settings.iou_threshold != new_settings.iou_threshold {
+                        self.settings = new_settings;
+                        self.update_model_parameters();
+                        self.status = format!("Settings reloaded | prob={:.2}, iou={:.2}",
+                                             self.settings.probability_threshold,
+                                             self.settings.iou_threshold);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Failed to reload settings: {}", e);
+                }
+            }
         }
     }
 
     pub fn load_model(&mut self, path: PathBuf) {
-        println!("Загрузка: {:?}", path);
+        println!("Loading: {:?}", path);
         match yolo_rs::model::YoloModelSession::from_filename_v8(&path) {
             Ok(mut s) => {
-                // Use settings from database
                 s.probability_threshold = Some(self.settings.probability_threshold);
                 s.iou_threshold = Some(self.settings.iou_threshold);
                 let size = if let Some(input) = s.session.inputs.first() {
@@ -164,10 +232,32 @@ impl YoloGuiApp {
                 self.model_input_size = size;
                 self.class_names = Arc::new(names);
                 self.status = format!("Loaded: {:?}", path.file_name().unwrap());
-                println!("Вход модели: {:?}", size);
+                println!("Model input: {:?}", size);
+
+                let db_path = PathBuf::from("yolo_settings.db");
+                if db_path.exists() {
+                    let (db_watcher, db_event_rx) = Self::init_db_watcher(&db_path);
+                    self.db_watcher = db_watcher;
+                    self.db_event_rx = db_event_rx;
+                    self.last_db_mtime = std::fs::metadata(&db_path).and_then(|m| m.modified()).ok();
+                }
             }
             Err(e) => {
                 self.status = format!("Error: {:?}", e);
+            }
+        }
+    }
+
+    pub fn save_settings(&mut self) {
+        if let Some(db) = &self.database {
+            if let Ok(db_lock) = db.lock() {
+                if db_lock.save_settings(&self.settings).is_ok() {
+                    let db_path = PathBuf::from("yolo_settings.db");
+                    let (db_watcher, db_event_rx) = Self::init_db_watcher(&db_path);
+                    self.db_watcher = db_watcher;
+                    self.db_event_rx = db_event_rx;
+                    self.last_db_mtime = std::fs::metadata(&db_path).and_then(|m| m.modified()).ok();
+                }
             }
         }
     }
@@ -205,7 +295,6 @@ impl YoloGuiApp {
                     ort::value::Value::from_array((vec![1usize, 3, th as usize, tw as usize], flat_data))
                         .map_err(|e| e.to_string())?;
 
-                // INFERENCE
                 let (output0_shape, output0_data, output1_opt) = {
                     let mut m = model_arc.lock().unwrap();
                     let outputs = m
@@ -228,7 +317,6 @@ impl YoloGuiApp {
                     (s0.to_vec(), d0.to_vec(), out1)
                 };
 
-                // PARSING
                 let num_rows = output0_shape[1] as usize;
                 let num_anchors = output0_shape[2] as usize;
                 let has_masks = output1_opt.is_some();
@@ -368,12 +456,43 @@ impl YoloGuiApp {
 
 impl eframe::App for YoloGuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let reload_needed = if let Some(rx) = &self.db_event_rx {
+            let mut reload = false;
+            while let Ok(_event) = rx.try_recv() {
+                println!("Database file changed, reloading settings...");
+                reload = true;
+            }
+            reload
+        } else {
+            false
+        };
+
+        if reload_needed {
+            self.reload_settings_from_db();
+        }
+
+        let now = std::time::Instant::now();
+        if self.last_check_time.is_none()
+            || now.duration_since(self.last_check_time.unwrap()).as_secs() >= 1
+        {
+            self.last_check_time = Some(now);
+            if let Ok(mtime) = std::fs::metadata("yolo_settings.db").and_then(|m| m.modified()) {
+                if self.last_db_mtime.map(|t| t != mtime).unwrap_or(true) {
+                    if let Ok(system_time) = mtime.elapsed() {
+                        if system_time.as_secs() < 2 {
+                            self.reload_settings_from_db();
+                            self.last_db_mtime = Some(mtime);
+                        }
+                    }
+                }
+            }
+        }
+
         if let Ok(msg) = self.rx.try_recv() {
             match msg {
                 AppMessage::Success(res) => {
                     self.texture =
                         Some(ctx.load_texture("img", res.texture_data, Default::default()));
-                    // Текстура теперь высокого разрешения (1280x1280), ставим LINEAR чтобы при уменьшении было красиво
                     self.mask_texture = res
                         .mask_texture
                         .map(|m| ctx.load_texture("masks", m, egui::TextureOptions::LINEAR));
@@ -455,61 +574,62 @@ impl eframe::App for YoloGuiApp {
 
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                // Add settings icon button on the left
-                if ui.button("⚙").clicked() {
-                    self.show_settings_window = !self.show_settings_window;
-                }
-
                 if self.is_processing {
                     ui.spinner();
                 }
-                ui.label(" ".to_owned() + &self.status);
+                ui.label(&self.status);
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("⚙").clicked() {
+                        self.show_settings_window = !self.show_settings_window;
+                    }
+                });
             });
         });
 
-        // Settings window
         if self.show_settings_window {
+            let mut prob = self.settings.probability_threshold;
+            let mut iou = self.settings.iou_threshold;
+            let mut reset_clicked = false;
+
             egui::Window::new("Model Settings")
                 .open(&mut self.show_settings_window)
                 .show(ctx, |ui| {
                     ui.label("Detection Thresholds:");
                     ui.horizontal(|ui| {
                         ui.label("Probability:");
-                        let mut prob = self.settings.probability_threshold;
                         if ui.add(egui::Slider::new(&mut prob, 0.0..=1.0)).changed() {
-                            self.settings.probability_threshold = prob;
-                            if let Some(db) = &self.database {
-                                if let Ok(db_lock) = db.lock() {
-                                    let _ = db_lock.save_settings(&self.settings);
-                                }
-                            }
                         }
                         ui.label(format!("{:.2}", prob));
                     });
 
                     ui.horizontal(|ui| {
                         ui.label("IoU:");
-                        let mut iou = self.settings.iou_threshold;
                         if ui.add(egui::Slider::new(&mut iou, 0.0..=1.0)).changed() {
-                            self.settings.iou_threshold = iou;
-                            if let Some(db) = &self.database {
-                                if let Ok(db_lock) = db.lock() {
-                                    let _ = db_lock.save_settings(&self.settings);
-                                }
-                            }
                         }
                         ui.label(format!("{:.2}", iou));
                     });
 
                     if ui.button("Reset to Defaults").clicked() {
-                        self.settings = ModelSettings::default();
-                        if let Some(db) = &self.database {
-                            if let Ok(db_lock) = db.lock() {
-                                let _ = db_lock.save_settings(&self.settings);
-                            }
-                        }
+                        reset_clicked = true;
                     }
                 });
+
+            if prob != self.settings.probability_threshold {
+                self.settings.probability_threshold = prob;
+                self.update_model_parameters();
+                self.save_settings();
+            }
+            if iou != self.settings.iou_threshold {
+                self.settings.iou_threshold = iou;
+                self.update_model_parameters();
+                self.save_settings();
+            }
+            if reset_clicked {
+                self.settings = ModelSettings::default();
+                self.update_model_parameters();
+                self.save_settings();
+            }
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
