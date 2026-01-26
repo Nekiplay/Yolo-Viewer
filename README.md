@@ -13,8 +13,6 @@ A high-performance, lightweight graphical interface for visualizing and testing 
 
 *   **Blazing Fast Inference:** Leverages Rust's performance to handle high-resolution video streams with minimal latency.
 *   **Latest YOLO Support:** Native compatibility with YOLOv11 and the cutting-edge YOLOv12 architectures.
-*   **Real-time Interaction:** Adjust Confidence and IoU thresholds on the fly using interactive sliders without restarting the stream.
-*   **Versatile Inputs:** Seamlessly switch between static images, local video files, and live RTSP/Webcam feeds.
 *   **Memory Efficient:** Significantly lower RAM and CPU usage compared to traditional Python-based viewers.
 
 ## 🛠 Tech Stack
